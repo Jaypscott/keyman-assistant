@@ -1,0 +1,16 @@
+{
+  "appId": "com.keyman.shiftplanner",
+  "appName": "Keyman Assistant",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": false,
+      "style": "LIGHT",
+      "backgroundColor": "#dff3ec"
+    }
+  },
+  "ios": {
+    "contentInset": "automatic"
+  }
+}
