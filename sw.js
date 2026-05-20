@@ -1,4 +1,4 @@
-const CACHE_NAME = "keyman-shift-planner-v63";
+const CACHE_NAME = "keyman-shift-planner-v64";
 const ASSETS = [
   "./",
   "index.html",
@@ -50,6 +50,8 @@ const ASSETS = [
   "styles.css?v=47",
   "config.js",
   "config.js?v=1",
+  "config.js?v=2",
+  "public/privacy.html",
   "app.js",
   "app.js?v=2",
   "app.js?v=3",

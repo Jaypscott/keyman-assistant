@@ -17,7 +17,8 @@
   "dependencies": {
     "@capacitor/core": "^7.0.0",
     "@capacitor/ios": "^7.0.0",
-    "@capacitor/status-bar": "^7.0.6"
+    "@capacitor/status-bar": "^7.0.6",
+    "pg": "^8.21.0"
   },
   "devDependencies": {
     "@capacitor/cli": "^7.0.0"

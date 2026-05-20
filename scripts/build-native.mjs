@@ -21,5 +21,6 @@ for (const file of files) {
 }
 
 await cp(join(root, "assets"), join(output, "assets"), { recursive: true });
+await cp(join(root, "public"), join(output, "public"), { recursive: true });
 
 console.log("Native web assets copied to www/");

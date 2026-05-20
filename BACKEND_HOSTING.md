@@ -7,16 +7,21 @@ This app can point to any HTTPS backend that implements the auth endpoints in `s
 1. Push this project to GitHub.
 2. In Render, choose New > Blueprint and connect the GitHub repo.
 3. Select this repo's `render.yaml`.
-4. Render should create `keyman-assistant-api` with:
+4. Render should create `keyman-assistant-api` and `keyman-assistant-db` with:
    - Build command: `npm install`
    - Start command: `npm start`
    - Health check path: `/api/health`
-   - Persistent disk: `/var/data`
-   - Environment variable: `AUTH_DATA_FILE=/var/data/auth-db.json`
+   - Environment variable: `DATABASE_URL` from the Postgres database
 5. After deploy, open `https://your-service.onrender.com/api/health`.
 6. If it returns `{"ok":true}`, copy the service's base URL.
 
-Manual setup also works: create a Web Service from the repo and use the same build command, start command, health check path, disk, and environment variable shown above.
+Manual setup also works: create a Render Postgres database, create a Web Service from the repo, and add `DATABASE_URL` from the database connection string.
+
+The privacy policy is hosted by the backend at:
+
+```text
+https://your-service.onrender.com/privacy
+```
 
 ## Point the app to production
 
@@ -25,12 +30,8 @@ Update `config.js`:
 ```js
 window.KEYMAN_CONFIG = {
   authApiBase: "https://your-render-service.onrender.com",
-  privacyPolicyUrl: "https://your-public-privacy-policy-url",
+  privacyPolicyUrl: "https://your-render-service.onrender.com/privacy",
 };
 ```
 
 Then run `npm run native:sync` and rebuild the iOS app.
-
-## Production note
-
-The current backend uses a JSON file for account storage. A persistent disk is enough for a small prototype, but a managed database such as Postgres is the better production path before real App Store users depend on it.
