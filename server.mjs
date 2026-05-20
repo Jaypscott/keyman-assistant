@@ -304,6 +304,11 @@ async function handleLogout(request, response) {
   return sendJson(response, 200, { ok: true });
 }
 
+async function handleHealth(response) {
+  if (pool) await ensurePostgres();
+  return sendJson(response, 200, { ok: true, storage: pool ? "postgres" : "json" });
+}
+
 function handlePrivacy(response) {
   return sendHtml(response, 200, readFileSync(PRIVACY_FILE, "utf8"));
 }
@@ -311,7 +316,7 @@ function handlePrivacy(response) {
 const server = createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") return sendJson(response, 204, {});
-    if (request.url === "/api/health") return sendJson(response, 200, { ok: true });
+    if (request.url === "/api/health") return handleHealth(response);
     if ((request.url === "/privacy" || request.url === "/privacy.html") && request.method === "GET") return handlePrivacy(response);
     if (request.url === "/api/auth/register" && request.method === "POST") return handleRegister(request, response);
     if (request.url === "/api/auth/login" && request.method === "POST") return handleLogin(request, response);
