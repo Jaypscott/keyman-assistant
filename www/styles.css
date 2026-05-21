@@ -691,7 +691,8 @@ h3 {
 
 .builder-action {
   display: grid;
-  gap: 10px;
+  gap: 12px;
+  margin-top: 12px;
   padding: 0 0 18px;
   background: transparent;
 }
@@ -1211,8 +1212,8 @@ h3 {
 .actions {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 10px;
-  margin: 16px 0 4px;
+  gap: 12px;
+  margin: 0 0 4px;
 }
 
 .bottom-nav {
