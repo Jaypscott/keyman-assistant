@@ -527,6 +527,7 @@ function renderBuilder() {
         </button>
         ${state.schedule ? `
           <div class="actions">
+            <button class="secondary-btn" id="sendScheduleMessage" type="button">Send message</button>
             <button class="secondary-btn" id="saveEvent">Add to calendar</button>
           </div>
         ` : ""}
@@ -571,6 +572,8 @@ function renderBuilder() {
         state.schedule[Number(row)].assignments[role][Number(position)] = event.target.value;
       });
     });
+
+    app.querySelector("#sendScheduleMessage").addEventListener("click", sendScheduleMessage);
 
     app.querySelector("#saveEvent").addEventListener("click", () => {
       const event = {
@@ -654,6 +657,37 @@ const roleLabels = {
   secondary: "Secondary",
   informal: "Informal",
 };
+
+function sendScheduleMessage() {
+  if (!state.schedule || !state.selectedShift) return;
+  const message = buildScheduleMessage(state.selectedShift, state.selectedDate, state.schedule);
+  window.location.href = `sms:&body=${encodeURIComponent(message)}`;
+}
+
+function buildScheduleMessage(shift, date, schedule) {
+  const roles = getScheduleRoles(schedule);
+  const rows = schedule.map((row) => {
+    const assignments = roles.map((role) => {
+      const people = (row.assignments[role] || []).join(", ");
+      return `${roleLabels[role]}: ${people}`;
+    }).join("\n");
+    return `${formatMessageTimeRange(row.time)}\n${assignments}`;
+  }).join("\n\n");
+
+  return [
+    "Here is the rotation schedule for our shift. See you soon!",
+    "",
+    `${formatDate(date)} · ${shift.label}`,
+    "",
+    rows,
+  ].join("\n");
+}
+
+function formatMessageTimeRange(range) {
+  return range
+    .replace(/\s+/g, "")
+    .replace(/am|pm/g, "");
+}
 
 function getScheduleRoles(schedule) {
   const firstRow = schedule && schedule[0];
