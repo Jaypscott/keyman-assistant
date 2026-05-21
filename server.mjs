@@ -20,7 +20,7 @@ const pool = DATABASE_URL ? new Pool({
 }) : null;
 let postgresReady;
 
-const defaultDb = { users: [], sessions: [] };
+const defaultDb = { users: [], sessions: [], appData: {} };
 
 function loadDb() {
   try {
@@ -40,7 +40,7 @@ function sendJson(response, status, body) {
   response.writeHead(status, {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
-    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Content-Type": "application/json",
   });
   response.end(JSON.stringify(body));
@@ -58,7 +58,7 @@ function readBody(request) {
     let data = "";
     request.on("data", (chunk) => {
       data += chunk;
-      if (data.length > 10000) {
+      if (data.length > 250000) {
         request.destroy();
         rejectBody(new Error("Request body is too large."));
       }
@@ -133,6 +133,15 @@ async function ensurePostgres() {
     `);
     await pool.query("CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id)");
     await pool.query("CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at)");
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS app_data (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        events JSONB NOT NULL DEFAULT '[]'::jsonb,
+        checks JSONB NOT NULL DEFAULT '{}'::jsonb,
+        topic TEXT NOT NULL DEFAULT '',
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
   })();
   return postgresReady;
 }
@@ -238,7 +247,57 @@ async function deleteUserAccount(userId, token) {
   const db = loadDb();
   db.users = db.users.filter((item) => item.id !== userId);
   db.sessions = db.sessions.filter((session) => session.userId !== userId && session.token !== token);
+  if (db.appData) delete db.appData[userId];
   saveDb(db);
+}
+
+function normalizeAppData(body = {}) {
+  return {
+    events: Array.isArray(body.events) ? body.events : [],
+    checks: body.checks && typeof body.checks === "object" && !Array.isArray(body.checks) ? body.checks : {},
+    topic: String(body.topic || ""),
+  };
+}
+
+function rowToAppData(row) {
+  return {
+    events: Array.isArray(row?.events) ? row.events : [],
+    checks: row?.checks && typeof row.checks === "object" ? row.checks : {},
+    topic: String(row?.topic || ""),
+  };
+}
+
+async function getUserAppData(userId) {
+  if (pool) {
+    await ensurePostgres();
+    const result = await pool.query("SELECT events, checks, topic FROM app_data WHERE user_id = $1", [userId]);
+    return rowToAppData(result.rows[0]);
+  }
+  const db = loadDb();
+  return normalizeAppData(db.appData?.[userId]);
+}
+
+async function saveUserAppData(userId, data) {
+  const appData = normalizeAppData(data);
+  if (pool) {
+    await ensurePostgres();
+    await pool.query(
+      `INSERT INTO app_data (user_id, events, checks, topic, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (user_id) DO UPDATE SET
+         events = EXCLUDED.events,
+         checks = EXCLUDED.checks,
+         topic = EXCLUDED.topic,
+         updated_at = NOW()`,
+      [userId, JSON.stringify(appData.events), JSON.stringify(appData.checks), appData.topic],
+    );
+    return appData;
+  }
+  const db = loadDb();
+  db.appData = db.appData || {};
+  db.appData[userId] = appData;
+  saveDb(db);
+  return appData;
 }
 
 async function handleRegister(request, response) {
@@ -304,6 +363,19 @@ async function handleLogout(request, response) {
   return sendJson(response, 200, { ok: true });
 }
 
+async function handleGetAppData(request, response) {
+  const user = await getSessionUser(request);
+  if (!user) return sendJson(response, 401, { error: "Sign in required." });
+  return sendJson(response, 200, await getUserAppData(user.id));
+}
+
+async function handleSaveAppData(request, response) {
+  const user = await getSessionUser(request);
+  if (!user) return sendJson(response, 401, { error: "Sign in required." });
+  const body = await readBody(request);
+  return sendJson(response, 200, await saveUserAppData(user.id, body));
+}
+
 async function handleHealth(response) {
   if (pool) await ensurePostgres();
   return sendJson(response, 200, { ok: true, storage: pool ? "postgres" : "json" });
@@ -323,6 +395,8 @@ const server = createServer(async (request, response) => {
     if (request.url === "/api/auth/me" && request.method === "GET") return handleMe(request, response);
     if (request.url === "/api/auth/me" && request.method === "DELETE") return handleDeleteMe(request, response);
     if (request.url === "/api/auth/logout" && request.method === "POST") return handleLogout(request, response);
+    if (request.url === "/api/app-data" && request.method === "GET") return handleGetAppData(request, response);
+    if (request.url === "/api/app-data" && request.method === "PUT") return handleSaveAppData(request, response);
     return sendJson(response, 404, { error: "Not found." });
   } catch (error) {
     return sendJson(response, 400, { error: error.message || "Request failed." });

@@ -46,6 +46,7 @@ const state = {
   message: "",
   events: readStore("keyman-events", []),
   checks: readStore("keyman-checks", {}),
+  topic: readStore("keyman-topic", ""),
   expanded: {},
   search: "",
   calendarDate: todayISO(),
@@ -53,12 +54,14 @@ const state = {
   calendarEditing: false,
   calendarDraft: [],
   calendarEditMessage: "",
+  appDataLoaded: false,
 };
 
 const app = document.querySelector("#app");
 const nav = document.querySelector(".bottom-nav");
 const shell = document.querySelector(".phone-shell");
 let toastTimer = null;
+let appDataSyncTimer = null;
 
 nav.addEventListener("click", (event) => {
   if (!state.authenticated) return;
@@ -174,6 +177,7 @@ async function handleAuthSubmit(event) {
     state.authMessage = "";
     localStorage.setItem("keyman-auth-email", result.user.email);
     setAuthToken(result.token);
+    await loadAccountData();
     updateNav();
     render();
   } catch (error) {
@@ -250,7 +254,7 @@ function renderPrivacyPolicy() {
         <h2>Information used by the app</h2>
         <p>The app stores your email address for sign in, volunteer names, rotation schedules, checklist progress, and discussion notes needed for shift planning.</p>
         <h2>How it is stored</h2>
-        <p>Schedule and checklist information is stored on this device. Account authentication is handled by the Keyman Assistant backend, and passwords are stored as salted hashes.</p>
+        <p>Schedule, checklist, and discussion information is saved to the Keyman Assistant backend for your account and cached on this device. Passwords are stored as salted hashes.</p>
         <h2>Sharing</h2>
         <p>Keyman Assistant does not sell personal information. Data is used only to support account access and shift planning.</p>
         <h2>Account deletion</h2>
@@ -440,7 +444,7 @@ function renderTopicScreen() {
       </div>
       <label class="topic-editor-label">
         <span>Discussion topic</span>
-        <textarea id="topicEditor" class="topic-editor" placeholder="Paste or type the topic of discussion here.">${escapeText(readStore("keyman-topic", ""))}</textarea>
+        <textarea id="topicEditor" class="topic-editor" placeholder="Paste or type the topic of discussion here.">${escapeText(state.topic)}</textarea>
       </label>
       <button class="primary-btn" id="saveTopic">Save topic</button>
     </section>
@@ -452,11 +456,13 @@ function renderTopicScreen() {
   });
 
   app.querySelector("#topicEditor").addEventListener("input", (event) => {
-    writeStore("keyman-topic", event.target.value);
+    state.topic = event.target.value;
+    persistAppData();
   });
 
   app.querySelector("#saveTopic").addEventListener("click", () => {
-    writeStore("keyman-topic", app.querySelector("#topicEditor").value);
+    state.topic = app.querySelector("#topicEditor").value;
+    persistAppData();
     showToast("Topic saved");
   });
 }
@@ -575,7 +581,7 @@ function renderBuilder() {
 
     app.querySelector("#sendScheduleMessage").addEventListener("click", sendScheduleMessage);
 
-    app.querySelector("#saveEvent").addEventListener("click", () => {
+    app.querySelector("#saveEvent").addEventListener("click", async () => {
       const event = {
         id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
         date: state.selectedDate,
@@ -588,8 +594,7 @@ function renderBuilder() {
       };
       state.events = [event, ...state.events.filter((item) => !(item.date === event.date && item.shiftId === event.shiftId))];
       state.checks[event.id] = state.checks[event.id] || Array.from({ length: tasks.length }, () => false);
-      writeStore("keyman-events", state.events);
-      writeStore("keyman-checks", state.checks);
+      await persistAppData({ immediate: true });
       state.tab = "calendar";
       state.selectedShift = null;
       state.schedule = null;
@@ -923,7 +928,7 @@ function closeCalendarDetail() {
   renderCalendar();
 }
 
-function updateCalendarEvent(clickEvent) {
+async function updateCalendarEvent(clickEvent) {
   clickEvent?.preventDefault();
   clickEvent?.stopPropagation();
   const calendarEvent = state.events.find((item) => item.id === state.calendarEventId);
@@ -949,8 +954,7 @@ function updateCalendarEvent(clickEvent) {
   };
   state.events = state.events.map((item) => (item.id === calendarEvent.id ? updatedEvent : item));
   state.checks[updatedEvent.id] = state.checks[updatedEvent.id] || Array.from({ length: tasks.length }, () => false);
-  writeStore("keyman-events", state.events);
-  writeStore("keyman-checks", state.checks);
+  await persistAppData({ immediate: true });
   state.calendarEventId = null;
   state.calendarEditing = false;
   state.calendarDraft = [];
@@ -960,7 +964,7 @@ function updateCalendarEvent(clickEvent) {
   showToast("Schedule updated");
 }
 
-function deleteCalendarEvent(clickEvent) {
+async function deleteCalendarEvent(clickEvent) {
   clickEvent?.preventDefault();
   clickEvent?.stopPropagation();
   const eventId = state.calendarEventId;
@@ -968,8 +972,7 @@ function deleteCalendarEvent(clickEvent) {
 
   state.events = state.events.filter((event) => event.id !== eventId);
   delete state.checks[eventId];
-  writeStore("keyman-events", state.events);
-  writeStore("keyman-checks", state.checks);
+  await persistAppData({ immediate: true });
   state.calendarEventId = null;
   state.calendarEditing = false;
   state.calendarDraft = [];
@@ -1054,7 +1057,7 @@ function renderChecklistResults() {
       const { id, index } = event.target.dataset;
       state.checks[id] = state.checks[id] || Array.from({ length: tasks.length }, () => false);
       state.checks[id][Number(index)] = event.target.checked;
-      writeStore("keyman-checks", state.checks);
+      persistAppData();
       renderChecklistResults();
     });
   });
@@ -1336,10 +1339,84 @@ function writeStore(key, value) {
   localStorage.setItem(key, JSON.stringify(value));
 }
 
+function getAppDataSnapshot() {
+  return {
+    events: state.events,
+    checks: state.checks,
+    topic: state.topic,
+  };
+}
+
+function saveAppDataLocal() {
+  writeStore("keyman-events", state.events);
+  writeStore("keyman-checks", state.checks);
+  writeStore("keyman-topic", state.topic);
+}
+
+function hasAppData(data) {
+  return Boolean(
+    (Array.isArray(data.events) && data.events.length)
+    || (data.checks && Object.keys(data.checks).length)
+    || String(data.topic || "").trim(),
+  );
+}
+
+function normalizeAppData(data = {}) {
+  return {
+    events: Array.isArray(data.events) ? data.events : [],
+    checks: data.checks && typeof data.checks === "object" && !Array.isArray(data.checks) ? data.checks : {},
+    topic: String(data.topic || ""),
+  };
+}
+
+function applyAppData(data) {
+  const normalized = normalizeAppData(data);
+  state.events = normalized.events;
+  state.checks = normalized.checks;
+  state.topic = normalized.topic;
+  saveAppDataLocal();
+}
+
+async function loadAccountData() {
+  const localData = getAppDataSnapshot();
+  try {
+    const remoteData = normalizeAppData(await authRequest("/api/app-data"));
+    if (!hasAppData(remoteData) && hasAppData(localData)) {
+      await saveAccountData(localData);
+      applyAppData(localData);
+    } else {
+      applyAppData(remoteData);
+    }
+    state.appDataLoaded = true;
+  } catch {
+    state.appDataLoaded = false;
+    saveAppDataLocal();
+  }
+}
+
+function persistAppData({ immediate = false } = {}) {
+  saveAppDataLocal();
+  if (!state.authenticated || !getAuthToken()) return Promise.resolve();
+  clearTimeout(appDataSyncTimer);
+  if (immediate) return saveAccountData(getAppDataSnapshot()).catch(() => {});
+  appDataSyncTimer = setTimeout(() => {
+    saveAccountData(getAppDataSnapshot()).catch(() => {});
+  }, 500);
+  return Promise.resolve();
+}
+
+async function saveAccountData(data) {
+  return authRequest("/api/app-data", {
+    method: "PUT",
+    body: normalizeAppData(data),
+  });
+}
+
 function clearLocalAppData() {
   ["keyman-events", "keyman-checks", "keyman-topic"].forEach((key) => localStorage.removeItem(key));
   state.events = [];
   state.checks = {};
+  state.topic = "";
   state.expanded = {};
   state.search = "";
   state.calendarDate = todayISO();
@@ -1377,6 +1454,7 @@ function clearAuthToken() {
 }
 
 function clearSignedInState({ clearLocalData = false } = {}) {
+  clearTimeout(appDataSyncTimer);
   clearAuthToken();
   localStorage.removeItem("keyman-auth-email");
   if (clearLocalData) clearLocalAppData();
@@ -1390,6 +1468,7 @@ function clearSignedInState({ clearLocalData = false } = {}) {
   state.profileView = "settings";
   state.profileMessage = "";
   state.profileBusy = false;
+  state.appDataLoaded = false;
   state.tab = "home";
   state.homeView = "shifts";
   window.location.hash = "";
@@ -1473,6 +1552,7 @@ async function initializeAuth() {
     state.authenticated = true;
     state.authChecking = false;
     localStorage.setItem("keyman-auth-email", result.user.email);
+    await loadAccountData();
   } catch {
     clearAuthToken();
     state.authChecking = false;
