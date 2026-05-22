@@ -13,13 +13,6 @@ const tasks = [
   "Sent EOS report",
 ];
 
-const emergencyPlanPages = [
-  "assets/emergency-plan-pages/page-1.png",
-  "assets/emergency-plan-pages/page-2.png",
-  "assets/emergency-plan-pages/page-3.png",
-  "assets/emergency-plan-pages/page-4.png",
-];
-
 const APP_CONFIG = window.KEYMAN_CONFIG || {};
 const AUTH_API_BASE = localStorage.getItem("keyman-auth-api") || APP_CONFIG.authApiBase || "http://127.0.0.1:3001";
 const PRIVACY_POLICY_URL = APP_CONFIG.privacyPolicyUrl || "";
@@ -477,14 +470,10 @@ function renderEmergencyPlanScreen() {
         </button>
         <div>
           <h1>Emergency Plan</h1>
-          <p class="subtle">Zone 2 Emergency Plan</p>
+          <p class="subtle">This file will be added after testing.</p>
         </div>
       </div>
-      <div class="plan-viewer" aria-label="Zone 2 Emergency Plan pages">
-        ${emergencyPlanPages.map((page, index) => `
-          <img class="plan-page" src="${page}" alt="Zone 2 Emergency Plan page ${index + 1}">
-        `).join("")}
-      </div>
+      <div class="empty-state">Emergency plan unavailable during testing.</div>
     </section>
   `;
 

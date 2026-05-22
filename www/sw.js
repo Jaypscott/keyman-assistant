@@ -1,4 +1,4 @@
-const CACHE_NAME = "keyman-shift-planner-v66";
+const CACHE_NAME = "keyman-shift-planner-v67";
 const ASSETS = [
   "./",
   "index.html",
@@ -92,11 +92,7 @@ const ASSETS = [
   "app.js?v=38",
   "app.js?v=39",
   "app.js?v=40",
-  "assets/zone-2-emergency-plan.pdf",
-  "assets/emergency-plan-pages/page-1.png",
-  "assets/emergency-plan-pages/page-2.png",
-  "assets/emergency-plan-pages/page-3.png",
-  "assets/emergency-plan-pages/page-4.png",
+  "app.js?v=41",
   "manifest.json",
   "assets/keyman-header.png",
   "assets/auth-logo.png",
