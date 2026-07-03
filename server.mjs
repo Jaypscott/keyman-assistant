@@ -4,6 +4,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
 import pg from "pg";
+import { fetchWeather, parseWeatherRequest } from "./server/weatherProxy.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || process.env.AUTH_PORT || 3001);
@@ -381,6 +382,18 @@ async function handleHealth(response) {
   return sendJson(response, 200, { ok: true, storage: pool ? "postgres" : "json" });
 }
 
+async function handleWeather(request, response) {
+  try {
+    const location = parseWeatherRequest(request.url);
+    return sendJson(response, 200, await fetchWeather(location));
+  } catch (error) {
+    const isInvalidLocation = error.message === "Invalid weather location.";
+    return sendJson(response, isInvalidLocation ? 400 : 503, {
+      error: isInvalidLocation ? error.message : "Weather is temporarily unavailable.",
+    });
+  }
+}
+
 function handlePrivacy(response) {
   return sendHtml(response, 200, readFileSync(PRIVACY_FILE, "utf8"));
 }
@@ -389,6 +402,7 @@ const server = createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") return sendJson(response, 204, {});
     if (request.url === "/api/health") return handleHealth(response);
+    if (request.url?.startsWith("/api/weather?") && request.method === "GET") return handleWeather(request, response);
     if ((request.url === "/privacy" || request.url === "/privacy.html") && request.method === "GET") return handlePrivacy(response);
     if (request.url === "/api/auth/register" && request.method === "POST") return handleRegister(request, response);
     if (request.url === "/api/auth/login" && request.method === "POST") return handleLogin(request, response);
