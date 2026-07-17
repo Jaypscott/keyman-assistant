@@ -2,8 +2,15 @@ import { createServer } from "node:http";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { pbkdf2Sync, randomBytes, timingSafeEqual } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import pg from "pg";
+import {
+  createPasswordRecord,
+  createResetCode,
+  hashResetCode,
+  passwordMatches,
+  resetCodeMatches,
+} from "./server/passwordSecurity.mjs";
 import { fetchWeather, parseWeatherRequest } from "./server/weatherProxy.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -11,8 +18,19 @@ const PORT = Number(process.env.PORT || process.env.AUTH_PORT || 3001);
 const DATA_FILE = resolve(process.env.AUTH_DATA_FILE || resolve(__dirname, "data/auth-db.json"));
 const PRIVACY_FILE = resolve(__dirname, "public/privacy.html");
 const DATABASE_URL = process.env.DATABASE_URL || "";
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
-const PASSWORD_ITERATIONS = 120000;
+const configuredSessionIdleDays = Number(process.env.SESSION_IDLE_TTL_DAYS || 7);
+export const SESSION_IDLE_TTL_MS = (
+  Number.isFinite(configuredSessionIdleDays) && configuredSessionIdleDays > 0
+    ? configuredSessionIdleDays
+    : 7
+) * 24 * 60 * 60 * 1000;
+const PASSWORD_RESET_TTL_MS = 15 * 60 * 1000;
+const PASSWORD_RESET_COOLDOWN_MS = 60 * 1000;
+const PASSWORD_RESET_MAX_ATTEMPTS = 5;
+const RESEND_API_KEY = process.env.RESEND_API_KEY || "";
+const PASSWORD_RESET_FROM_EMAIL = process.env.PASSWORD_RESET_FROM_EMAIL || "";
+const PASSWORD_RESET_SECRET = process.env.PASSWORD_RESET_SECRET
+  || (process.env.NODE_ENV === "production" ? "" : "keyman-local-reset-secret");
 
 const { Pool } = pg;
 const pool = DATABASE_URL ? new Pool({
@@ -21,7 +39,7 @@ const pool = DATABASE_URL ? new Pool({
 }) : null;
 let postgresReady;
 
-const defaultDb = { users: [], sessions: [], appData: {} };
+const defaultDb = { users: [], sessions: [], appData: {}, passwordResets: {} };
 
 function loadDb() {
   try {
@@ -84,16 +102,6 @@ function validateCredentials(email, password) {
   return "";
 }
 
-function hashPassword(password, salt) {
-  return pbkdf2Sync(String(password), salt, PASSWORD_ITERATIONS, 32, "sha256").toString("hex");
-}
-
-function passwordMatches(password, user) {
-  const expected = Buffer.from(user.passwordHash, "hex");
-  const actual = Buffer.from(hashPassword(password, user.salt), "hex");
-  return expected.length === actual.length && timingSafeEqual(expected, actual);
-}
-
 function publicUser(user) {
   return {
     id: user.id,
@@ -135,6 +143,15 @@ async function ensurePostgres() {
     await pool.query("CREATE INDEX IF NOT EXISTS sessions_user_id_idx ON sessions(user_id)");
     await pool.query("CREATE INDEX IF NOT EXISTS sessions_expires_at_idx ON sessions(expires_at)");
     await pool.query(`
+      CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        token_hash TEXT NOT NULL,
+        expires_at BIGINT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        requested_at BIGINT NOT NULL
+      )
+    `);
+    await pool.query(`
       CREATE TABLE IF NOT EXISTS app_data (
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         events JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -171,6 +188,138 @@ async function insertUser(user) {
   saveDb(db);
 }
 
+async function getPasswordReset(userId) {
+  if (pool) {
+    await ensurePostgres();
+    const result = await pool.query(
+      "SELECT token_hash, expires_at, attempts, requested_at FROM password_reset_tokens WHERE user_id = $1",
+      [userId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      tokenHash: row.token_hash,
+      expiresAt: Number(row.expires_at),
+      attempts: Number(row.attempts),
+      requestedAt: Number(row.requested_at),
+    };
+  }
+  const db = loadDb();
+  return db.passwordResets?.[userId] || null;
+}
+
+async function savePasswordReset(userId, reset) {
+  if (pool) {
+    await ensurePostgres();
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, attempts, requested_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (user_id) DO UPDATE SET
+         token_hash = EXCLUDED.token_hash,
+         expires_at = EXCLUDED.expires_at,
+         attempts = EXCLUDED.attempts,
+         requested_at = EXCLUDED.requested_at`,
+      [userId, reset.tokenHash, reset.expiresAt, reset.attempts, reset.requestedAt],
+    );
+    return;
+  }
+  const db = loadDb();
+  db.passwordResets = db.passwordResets || {};
+  db.passwordResets[userId] = reset;
+  saveDb(db);
+}
+
+async function incrementPasswordResetAttempts(userId) {
+  if (pool) {
+    await ensurePostgres();
+    await pool.query(
+      "UPDATE password_reset_tokens SET attempts = attempts + 1 WHERE user_id = $1",
+      [userId],
+    );
+    return;
+  }
+  const db = loadDb();
+  if (db.passwordResets?.[userId]) {
+    db.passwordResets[userId].attempts += 1;
+    saveDb(db);
+  }
+}
+
+async function deletePasswordReset(userId) {
+  if (pool) {
+    await ensurePostgres();
+    await pool.query("DELETE FROM password_reset_tokens WHERE user_id = $1", [userId]);
+    return;
+  }
+  const db = loadDb();
+  if (db.passwordResets) delete db.passwordResets[userId];
+  saveDb(db);
+}
+
+async function completePasswordReset(userId, passwordRecord) {
+  if (pool) {
+    await ensurePostgres();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        "UPDATE users SET salt = $1, password_hash = $2 WHERE id = $3",
+        [passwordRecord.salt, passwordRecord.passwordHash, userId],
+      );
+      await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+      await client.query("DELETE FROM password_reset_tokens WHERE user_id = $1", [userId]);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+    return;
+  }
+
+  const db = loadDb();
+  const user = db.users.find((item) => item.id === userId);
+  if (!user) throw new Error("Account no longer exists.");
+  user.salt = passwordRecord.salt;
+  user.passwordHash = passwordRecord.passwordHash;
+  db.sessions = db.sessions.filter((session) => session.userId !== userId);
+  if (db.passwordResets) delete db.passwordResets[userId];
+  saveDb(db);
+}
+
+async function sendPasswordResetEmail(email, code, userId, requestedAt) {
+  // Ownership verification must fail closed in production. The reset code is
+  // exposed only outside production so local development can test the flow
+  // before transactional email credentials are configured.
+  if (!RESEND_API_KEY || !PASSWORD_RESET_FROM_EMAIL) {
+    if (process.env.NODE_ENV === "production") {
+      throw new Error("Password reset email is not configured.");
+    }
+    return false;
+  }
+
+  const emailResponse = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    signal: AbortSignal.timeout(10_000),
+    headers: {
+      Authorization: `Bearer ${RESEND_API_KEY}`,
+      "Content-Type": "application/json",
+      "Idempotency-Key": `password-reset-${userId}-${requestedAt}`,
+    },
+    body: JSON.stringify({
+      from: PASSWORD_RESET_FROM_EMAIL,
+      to: [email],
+      subject: "Keyman Assistant password reset code",
+      text: `Your Keyman Assistant password reset code is ${code}. It expires in 15 minutes. If you did not request this code, you can ignore this email.`,
+    }),
+  });
+  if (!emailResponse.ok) {
+    throw new Error(`Unable to send password reset email (HTTP ${emailResponse.status}).`);
+  }
+  return true;
+}
+
 async function createSession(userId) {
   const now = Date.now();
   const token = randomBytes(32).toString("hex");
@@ -178,7 +327,7 @@ async function createSession(userId) {
     token,
     userId,
     createdAt: now,
-    expiresAt: now + SESSION_TTL_MS,
+    expiresAt: now + SESSION_IDLE_TTL_MS,
   };
   if (pool) {
     await ensurePostgres();
@@ -212,11 +361,16 @@ async function getSessionUser(request) {
     await ensurePostgres();
     await pool.query("DELETE FROM sessions WHERE expires_at <= $1", [now]);
     const result = await pool.query(
-      `SELECT users.*
-       FROM sessions
-       JOIN users ON users.id = sessions.user_id
-       WHERE sessions.token = $1 AND sessions.expires_at > $2`,
-      [token, now],
+      `WITH active_session AS (
+         UPDATE sessions
+         SET expires_at = $3
+         WHERE token = $1 AND expires_at > $2
+         RETURNING user_id
+       )
+       SELECT users.*
+       FROM active_session
+       JOIN users ON users.id = active_session.user_id`,
+      [token, now, now + SESSION_IDLE_TTL_MS],
     );
     return rowToUser(result.rows[0]);
   }
@@ -224,7 +378,11 @@ async function getSessionUser(request) {
   const db = loadDb();
   const session = db.sessions.find((item) => item.token === token && item.expiresAt > now);
   if (!session) return null;
-  return db.users.find((user) => user.id === session.userId) || null;
+  const user = db.users.find((item) => item.id === session.userId) || null;
+  if (!user) return null;
+  session.expiresAt = now + SESSION_IDLE_TTL_MS;
+  saveDb(db);
+  return user;
 }
 
 async function deleteSession(token) {
@@ -312,17 +470,100 @@ async function handleRegister(request, response) {
     return sendJson(response, 409, { error: "An account already exists for that email." });
   }
 
-  const salt = randomBytes(16).toString("hex");
+  const passwordRecord = createPasswordRecord(password);
   const user = {
     id: randomBytes(12).toString("hex"),
     email,
-    salt,
-    passwordHash: hashPassword(password, salt),
+    ...passwordRecord,
     createdAt: new Date().toISOString(),
   };
   await insertUser(user);
   const token = await createSession(user.id);
   return sendJson(response, 201, { token, user: publicUser(user) });
+}
+
+async function handlePasswordResetRequest(request, response) {
+  const body = await readBody(request);
+  const email = normalizeEmail(body.email);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return sendJson(response, 400, { error: "Enter a valid email address." });
+  }
+
+  const user = await findUserByEmail(email);
+  // Always return the same result for unknown addresses so this endpoint
+  // cannot be used to discover which people have Keyman accounts.
+  if (!user) return sendJson(response, 200, {
+    ok: true,
+    expiresInSeconds: PASSWORD_RESET_TTL_MS / 1000,
+  });
+  if (!PASSWORD_RESET_SECRET) {
+    return sendJson(response, 503, { error: "Password reset is not configured." });
+  }
+
+  const now = Date.now();
+  const existingReset = await getPasswordReset(user.id);
+  if (existingReset && now - existingReset.requestedAt < PASSWORD_RESET_COOLDOWN_MS) {
+    return sendJson(response, 429, { error: "Please wait before requesting another reset code." });
+  }
+
+  const code = createResetCode();
+  const reset = {
+    tokenHash: hashResetCode(code, PASSWORD_RESET_SECRET),
+    expiresAt: now + PASSWORD_RESET_TTL_MS,
+    attempts: 0,
+    requestedAt: now,
+  };
+  await savePasswordReset(user.id, reset);
+
+  try {
+    const delivered = await sendPasswordResetEmail(email, code, user.id, now);
+    return sendJson(response, 200, {
+      ok: true,
+      expiresInSeconds: PASSWORD_RESET_TTL_MS / 1000,
+      developmentCode: delivered ? undefined : code,
+    });
+  } catch (error) {
+    await deletePasswordReset(user.id);
+    console.error("Password reset email delivery failed:", error.message || error);
+    return sendJson(response, 503, {
+      error: "Password reset email is temporarily unavailable. Please try again later.",
+      code: "PASSWORD_RESET_DELIVERY_FAILED",
+    });
+  }
+}
+
+async function handlePasswordReset(request, response) {
+  const body = await readBody(request);
+  const email = normalizeEmail(body.email);
+  const code = String(body.code || "").trim();
+  const newPassword = String(body.newPassword || "");
+  const error = validateCredentials(email, newPassword);
+  if (error) return sendJson(response, 400, { error });
+  if (!/^\d{6}$/.test(code)) {
+    return sendJson(response, 400, { error: "Enter the six-digit reset code." });
+  }
+  if (!PASSWORD_RESET_SECRET) {
+    return sendJson(response, 503, { error: "Password reset is not configured." });
+  }
+
+  const user = await findUserByEmail(email);
+  if (!user) return sendJson(response, 404, { error: "No account found with that email." });
+  const reset = await getPasswordReset(user.id);
+  const invalidOrExpired = !reset
+    || reset.expiresAt <= Date.now()
+    || reset.attempts >= PASSWORD_RESET_MAX_ATTEMPTS;
+  if (invalidOrExpired) {
+    if (reset) await deletePasswordReset(user.id);
+    return sendJson(response, 400, { error: "Reset code is invalid or expired." });
+  }
+
+  if (!resetCodeMatches(code, reset.tokenHash, PASSWORD_RESET_SECRET)) {
+    await incrementPasswordResetAttempts(user.id);
+    return sendJson(response, 400, { error: "Reset code is invalid or expired." });
+  }
+
+  await completePasswordReset(user.id, createPasswordRecord(newPassword));
+  return sendJson(response, 200, { ok: true });
 }
 
 async function handleLogin(request, response) {
@@ -379,7 +620,17 @@ async function handleSaveAppData(request, response) {
 
 async function handleHealth(response) {
   if (pool) await ensurePostgres();
-  return sendJson(response, 200, { ok: true, storage: pool ? "postgres" : "json" });
+  return sendJson(response, 200, {
+    ok: true,
+    storage: pool ? "postgres" : "json",
+    features: {
+      passwordReset: Boolean(
+        PASSWORD_RESET_SECRET
+          && (process.env.NODE_ENV !== "production" || (RESEND_API_KEY && PASSWORD_RESET_FROM_EMAIL)),
+      ),
+      sessionIdleTimeoutDays: SESSION_IDLE_TTL_MS / (24 * 60 * 60 * 1000),
+    },
+  });
 }
 
 async function handleWeather(request, response) {
@@ -398,7 +649,7 @@ function handlePrivacy(response) {
   return sendHtml(response, 200, readFileSync(PRIVACY_FILE, "utf8"));
 }
 
-const server = createServer(async (request, response) => {
+export const server = createServer(async (request, response) => {
   try {
     if (request.method === "OPTIONS") return sendJson(response, 204, {});
     if (request.url === "/api/health") return handleHealth(response);
@@ -406,6 +657,8 @@ const server = createServer(async (request, response) => {
     if ((request.url === "/privacy" || request.url === "/privacy.html") && request.method === "GET") return handlePrivacy(response);
     if (request.url === "/api/auth/register" && request.method === "POST") return handleRegister(request, response);
     if (request.url === "/api/auth/login" && request.method === "POST") return handleLogin(request, response);
+    if (request.url === "/api/auth/password-reset/request" && request.method === "POST") return handlePasswordResetRequest(request, response);
+    if (request.url === "/api/auth/password-reset" && request.method === "POST") return handlePasswordReset(request, response);
     if (request.url === "/api/auth/me" && request.method === "GET") return handleMe(request, response);
     if (request.url === "/api/auth/me" && request.method === "DELETE") return handleDeleteMe(request, response);
     if (request.url === "/api/auth/logout" && request.method === "POST") return handleLogout(request, response);
@@ -417,6 +670,8 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Keyman auth backend running at http://127.0.0.1:${PORT}`);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  server.listen(PORT, "0.0.0.0", () => {
+    console.log(`Keyman auth backend running at http://127.0.0.1:${PORT}`);
+  });
+}

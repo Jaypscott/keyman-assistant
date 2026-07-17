@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+
 import {
   buildOpenMeteoUrl,
   fetchWeather,
@@ -12,7 +13,7 @@ const location = {
   timezone: "America/New_York",
 };
 
-test("accepts Jacksonville weather requests but rejects an open proxy", () => {
+test("accepts Jacksonville-area weather requests and rejects an open proxy", () => {
   assert.deepEqual(
     parseWeatherRequest("/api/weather?latitude=30.2947&longitude=-81.3931&timezone=America%2FNew_York"),
     location,
@@ -23,17 +24,22 @@ test("accepts Jacksonville weather requests but rejects an open proxy", () => {
   );
 });
 
-test("builds a fixed imperial Open-Meteo request", () => {
+test("builds a fixed imperial Open-Meteo request on the server", () => {
   const url = new URL(buildOpenMeteoUrl(location));
   assert.equal(url.hostname, "api.open-meteo.com");
   assert.equal(url.searchParams.get("temperature_unit"), "fahrenheit");
   assert.equal(url.searchParams.get("wind_speed_unit"), "mph");
+  assert.match(url.searchParams.get("current"), /weather_code/);
 });
 
-test("returns the provider payload", async () => {
+test("returns the provider payload through the proxy", async () => {
   const payload = { current: { temperature_2m: 82, weather_code: 1 } };
-  assert.equal(await fetchWeather(location, {
+  const result = await fetchWeather(location, {
     now: () => 1,
-    fetchImpl: async () => ({ ok: true, json: async () => payload }),
-  }), payload);
+    fetchImpl: async () => ({
+      ok: true,
+      json: async () => payload,
+    }),
+  });
+  assert.equal(result, payload);
 });

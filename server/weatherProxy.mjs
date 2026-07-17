@@ -10,6 +10,7 @@ const CURRENT_FIELDS = [
   "wind_speed_10m",
   "is_day",
 ];
+
 const DAILY_FIELDS = ["temperature_2m_max", "temperature_2m_min"];
 const cache = new Map();
 
@@ -18,6 +19,7 @@ export function parseWeatherRequest(requestUrl) {
   const latitude = Number(url.searchParams.get("latitude"));
   const longitude = Number(url.searchParams.get("longitude"));
   const timezone = url.searchParams.get("timezone") || "America/New_York";
+
   if (
     !Number.isFinite(latitude)
     || !Number.isFinite(longitude)
@@ -29,6 +31,7 @@ export function parseWeatherRequest(requestUrl) {
   ) {
     throw new Error("Invalid weather location.");
   }
+
   return { latitude, longitude, timezone };
 }
 
