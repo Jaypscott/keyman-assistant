@@ -13,6 +13,14 @@ services:
         fromDatabase:
           name: keyman-assistant-db
           property: connectionString
+      - key: PASSWORD_RESET_SECRET
+        generateValue: true
+      - key: RESEND_API_KEY
+        sync: false
+      - key: PASSWORD_RESET_FROM_EMAIL
+        sync: false
+      - key: SESSION_IDLE_TTL_DAYS
+        value: 7
 
 databases:
   - name: keyman-assistant-db

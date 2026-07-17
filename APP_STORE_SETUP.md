@@ -61,4 +61,6 @@ User records are saved to `data/auth-db.json` during local development. Password
 - In Xcode, set the final Bundle Identifier if `com.keyman.shiftplanner` needs to be changed.
 - Add app icons, launch screen, signing team, and App Store metadata.
 - Host the authentication backend on a secure HTTPS server and point the app to that backend URL.
+- Confirm the App Privacy answers disclose saved volunteer phone numbers as user-provided contact data, and use the updated hosted privacy-policy URL.
+- Test roster OCR and the group-message warning on a physical iPhone; the simulator cannot send SMS.
 - Archive the app in Xcode and upload it through Organizer.

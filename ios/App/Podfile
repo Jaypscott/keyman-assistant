@@ -21,4 +21,21 @@ end
 
 post_install do |installer|
   assertDeploymentTarget(installer)
+
+  framework_script = 'Pods/Target Support Files/Pods-App/Pods-App-frameworks.sh'
+  next unless File.exist?(framework_script)
+
+  script = File.read(framework_script)
+  script.gsub!(
+    'source="$(readlink "${source}")"',
+    <<~'SH'.strip
+    linked_source="$(readlink "${source}")"
+    if [[ "${linked_source}" != /* ]]; then
+      source="$(cd "$(dirname "${source}")" && realpath "${linked_source}")"
+    else
+      source="${linked_source}"
+    fi
+    SH
+  )
+  File.write(framework_script, script)
 end
