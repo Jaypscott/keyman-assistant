@@ -12,6 +12,7 @@ import {
   resetCodeMatches,
 } from "./server/passwordSecurity.mjs";
 import { fetchWeather, parseWeatherRequest } from "./server/weatherProxy.mjs";
+import { migrateLegacyTopic } from "./services/notes/noteService.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || process.env.AUTH_PORT || 3001);
@@ -157,9 +158,31 @@ async function ensurePostgres() {
         events JSONB NOT NULL DEFAULT '[]'::jsonb,
         checks JSONB NOT NULL DEFAULT '{}'::jsonb,
         topic TEXT NOT NULL DEFAULT '',
+        notes JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    await pool.query("ALTER TABLE app_data ADD COLUMN IF NOT EXISTS notes JSONB NOT NULL DEFAULT '[]'::jsonb");
+    await pool.query(`
+      UPDATE app_data
+      SET
+        notes = notes || jsonb_build_array(jsonb_build_object(
+          'id', 'legacy-topic',
+          'title', 'Discussion Topic',
+          'body', topic,
+          'createdAt', updated_at,
+          'updatedAt', updated_at
+        )),
+        topic = ''
+      WHERE BTRIM(topic) <> ''
+        AND NOT EXISTS (
+          SELECT 1
+          FROM jsonb_array_elements(notes) AS note
+          WHERE note->>'id' = 'legacy-topic'
+             OR (note->>'title' = 'Discussion Topic' AND BTRIM(note->>'body') = BTRIM(topic))
+        )
+    `);
+    await pool.query("UPDATE app_data SET topic = '' WHERE BTRIM(topic) <> ''");
   })();
   return postgresReady;
 }
@@ -411,52 +434,77 @@ async function deleteUserAccount(userId, token) {
 }
 
 function normalizeAppData(body = {}) {
+  const migrated = migrateLegacyTopic({
+    notes: body.notes,
+    topic: body.topic,
+  });
   return {
     events: Array.isArray(body.events) ? body.events : [],
     checks: body.checks && typeof body.checks === "object" && !Array.isArray(body.checks) ? body.checks : {},
-    topic: String(body.topic || ""),
+    notes: migrated.notes,
+    topic: "",
   };
 }
 
 function rowToAppData(row) {
-  return {
-    events: Array.isArray(row?.events) ? row.events : [],
-    checks: row?.checks && typeof row.checks === "object" ? row.checks : {},
-    topic: String(row?.topic || ""),
-  };
+  return normalizeAppData(row);
 }
 
 async function getUserAppData(userId) {
   if (pool) {
     await ensurePostgres();
-    const result = await pool.query("SELECT events, checks, topic FROM app_data WHERE user_id = $1", [userId]);
+    const result = await pool.query("SELECT events, checks, notes, topic FROM app_data WHERE user_id = $1", [userId]);
     return rowToAppData(result.rows[0]);
   }
   const db = loadDb();
-  return normalizeAppData(db.appData?.[userId]);
+  const stored = db.appData?.[userId];
+  const appData = normalizeAppData(stored);
+  if (stored && (String(stored.topic || "").trim() || !Array.isArray(stored.notes))) {
+    db.appData[userId] = appData;
+    saveDb(db);
+  }
+  return appData;
 }
 
 async function saveUserAppData(userId, data) {
-  const appData = normalizeAppData(data);
+  const includesNotes = Object.prototype.hasOwnProperty.call(data, "notes");
+  const appData = normalizeAppData({
+    ...data,
+    notes: includesNotes ? data.notes : [],
+    topic: includesNotes ? data.topic : "",
+  });
   if (pool) {
     await ensurePostgres();
-    await pool.query(
-      `INSERT INTO app_data (user_id, events, checks, topic, updated_at)
-       VALUES ($1, $2, $3, $4, NOW())
+    const result = await pool.query(
+      `INSERT INTO app_data (user_id, events, checks, notes, topic, updated_at)
+       VALUES ($1, $2, $3, $4, '', NOW())
        ON CONFLICT (user_id) DO UPDATE SET
          events = EXCLUDED.events,
          checks = EXCLUDED.checks,
-         topic = EXCLUDED.topic,
-         updated_at = NOW()`,
-      [userId, JSON.stringify(appData.events), JSON.stringify(appData.checks), appData.topic],
+         notes = CASE WHEN $5 THEN EXCLUDED.notes ELSE app_data.notes END,
+         topic = '',
+         updated_at = NOW()
+       RETURNING events, checks, notes, topic`,
+      [
+        userId,
+        JSON.stringify(appData.events),
+        JSON.stringify(appData.checks),
+        JSON.stringify(appData.notes),
+        includesNotes,
+      ],
     );
-    return appData;
+    return rowToAppData(result.rows[0]);
   }
   const db = loadDb();
   db.appData = db.appData || {};
-  db.appData[userId] = appData;
+  const existing = normalizeAppData(db.appData[userId]);
+  db.appData[userId] = {
+    ...appData,
+    notes: includesNotes ? appData.notes : existing.notes,
+    topic: "",
+  };
   saveDb(db);
-  return appData;
+  return db.appData[userId];
 }
 
 async function handleRegister(request, response) {

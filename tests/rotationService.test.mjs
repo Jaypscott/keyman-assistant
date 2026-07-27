@@ -62,3 +62,52 @@ test("shows every volunteer in each rotation for eight-slot shifts", () => {
     });
   }
 });
+
+test("primary-only mode uses Primary and Informal for a full crew", () => {
+  const shift = {
+    start: "10:00",
+    end: "13:00",
+    slots: 6,
+    minutes: 30,
+  };
+
+  for (const volunteerCount of [6, 8]) {
+    const names = Array.from({ length: volunteerCount }, (_, index) => `Volunteer ${index + 1}`);
+    const schedule = createSchedule(names, shift, 30, { primaryOnly: true });
+    const primaryCounts = Object.fromEntries(names.map((name) => [name, 0]));
+
+    schedule.forEach((row) => {
+      assert.deepEqual(Object.keys(row.assignments).sort(), ["informal", "primary"]);
+      assert.equal(row.assignments.primary.length, 2);
+      assert.equal(row.assignments.informal.length, volunteerCount - 2);
+      assert.deepEqual(
+        [...row.assignments.primary, ...row.assignments.informal].sort(),
+        names.slice().sort(),
+      );
+      row.assignments.primary.forEach((name) => {
+        primaryCounts[name] += 1;
+      });
+    });
+
+    const counts = Object.values(primaryCounts);
+    assert.ok(Math.max(...counts) - Math.min(...counts) <= 1);
+  }
+});
+
+test("normal mode keeps Secondary assignments for a full six-person crew", () => {
+  const names = Array.from({ length: 6 }, (_, index) => `Volunteer ${index + 1}`);
+  const shift = {
+    start: "10:00",
+    end: "13:00",
+    slots: 6,
+    minutes: 30,
+  };
+  const schedule = createSchedule(names, shift);
+
+  schedule.forEach((row) => {
+    assert.deepEqual(Object.keys(row.assignments).sort(), ["informal", "primary", "secondary"]);
+    assert.equal(row.assignments.primary.length, 2);
+    assert.equal(row.assignments.secondary.length, 2);
+    assert.equal(row.assignments.informal.length, 2);
+  });
+});

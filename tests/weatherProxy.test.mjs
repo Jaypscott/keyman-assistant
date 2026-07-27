@@ -24,6 +24,17 @@ test("accepts Jacksonville-area weather requests and rejects an open proxy", () 
   );
 });
 
+test("accepts weather requests for UNF - The Green", () => {
+  assert.deepEqual(
+    parseWeatherRequest("/api/weather?latitude=30.2690336&longitude=-81.5066707&timezone=America%2FNew_York"),
+    {
+      latitude: 30.2690336,
+      longitude: -81.5066707,
+      timezone: "America/New_York",
+    },
+  );
+});
+
 test("builds a fixed imperial Open-Meteo request on the server", () => {
   const url = new URL(buildOpenMeteoUrl(location));
   assert.equal(url.hostname, "api.open-meteo.com");

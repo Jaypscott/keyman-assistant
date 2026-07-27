@@ -9,6 +9,15 @@ export const JACKSONVILLE_BEACH_WEATHER_LOCATION = Object.freeze({
   timezone: "America/New_York",
 });
 
+export const UNF_GREEN_WEATHER_LOCATION = Object.freeze({
+  id: "unf-green-fl",
+  name: "UNF - The Green",
+  region: "FL",
+  latitude: 30.2690336,
+  longitude: -81.5066707,
+  timezone: "America/New_York",
+});
+
 const beachesShifts = Object.freeze([
   Object.freeze({ id: "morning", label: "9:00am - 12:00pm", shortLabel: "9:00a - 12:00p", start: "09:00", end: "12:00", slots: 6, minutes: 30 }),
   Object.freeze({ id: "midday", label: "12:00pm - 3:00pm", shortLabel: "12:00p - 3:00p", start: "12:00", end: "15:00", slots: 6, minutes: 30 }),
@@ -18,6 +27,10 @@ const beachesShifts = Object.freeze([
 
 const pierShifts = Object.freeze([
   Object.freeze({ id: "jax-pier-midday", label: "10:00am - 1:00pm", shortLabel: "10:00a - 1:00p", start: "10:00", end: "13:00", slots: 6, minutes: 30 }),
+]);
+
+const unfGreenShifts = Object.freeze([
+  Object.freeze({ id: "unf-green-midday", label: "10:00am - 1:00pm", shortLabel: "10:00a - 1:00p", start: "10:00", end: "13:00", slots: 6, minutes: 30 }),
 ]);
 
 export const locationPages = Object.freeze([
@@ -38,6 +51,15 @@ export const locationPages = Object.freeze([
     headingTextColor: "#ffffff",
     weatherLocation: JACKSONVILLE_BEACH_WEATHER_LOCATION,
     shifts: pierShifts,
+  }),
+  Object.freeze({
+    id: "unf-green",
+    title: "UNF - The Green",
+    address: "1 UNF Dr, Jacksonville, FL 32224",
+    backgroundColor: "#dff3ec",
+    headingTextColor: "#ffffff",
+    weatherLocation: UNF_GREEN_WEATHER_LOCATION,
+    shifts: unfGreenShifts,
   }),
 ]);
 

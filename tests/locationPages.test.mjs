@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   JACKSONVILLE_BEACH_WEATHER_LOCATION,
+  UNF_GREEN_WEATHER_LOCATION,
   locationPages,
   shifts,
 } from "../constants/locationPages.mjs";
@@ -28,7 +29,26 @@ test("configures Jax Fishing Pier with one location-specific shift and weather",
   assert.deepEqual(pier.shifts.map(({ shortLabel, start, end }) => ({ shortLabel, start, end })), [
     { shortLabel: "10:00a - 1:00p", start: "10:00", end: "13:00" },
   ]);
-  assert.equal(shifts.length, 5);
+  assert.equal(shifts.length, 6);
+});
+
+test("configures UNF - The Green as the third page with one shift and local weather", () => {
+  const unf = locationPages[2];
+  assert.equal(unf.id, "unf-green");
+  assert.equal(unf.title, "UNF - The Green");
+  assert.equal(unf.address, "1 UNF Dr, Jacksonville, FL 32224");
+  assert.equal(unf.weatherLocation, UNF_GREEN_WEATHER_LOCATION);
+  assert.deepEqual(unf.shifts, [
+    {
+      id: "unf-green-midday",
+      label: "10:00am - 1:00pm",
+      shortLabel: "10:00a - 1:00p",
+      start: "10:00",
+      end: "13:00",
+      slots: 6,
+      minutes: 30,
+    },
+  ]);
 });
 
 test("supports every existing rotation option for the Pier shift", () => {
@@ -43,4 +63,11 @@ test("builds Jacksonville Beach weather requests from the Pier location", () => 
   const url = new URL(buildWeatherUrl(JACKSONVILLE_BEACH_WEATHER_LOCATION));
   assert.equal(url.searchParams.get("latitude"), "30.2947");
   assert.equal(url.searchParams.get("longitude"), "-81.3931");
+});
+
+test("builds UNF weather requests from The Green coordinates", () => {
+  const url = new URL(buildWeatherUrl(UNF_GREEN_WEATHER_LOCATION));
+  assert.equal(url.searchParams.get("latitude"), "30.2690336");
+  assert.equal(url.searchParams.get("longitude"), "-81.5066707");
+  assert.equal(url.searchParams.get("timezone"), "America/New_York");
 });

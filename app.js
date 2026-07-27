@@ -4,9 +4,15 @@ import { createWeatherController } from "./hooks/useWeather.mjs";
 import { findLocationById, locationPages, shifts } from "./constants/locationPages.mjs";
 import {
   calculateRotationIntervals,
-  canUseScheduleActions,
   createSchedule,
 } from "./services/schedule/rotationService.mjs";
+import {
+  calendarMonthCells,
+  eventsForDate,
+  eventsForMonth,
+  monthStartISO,
+  shiftCalendarDateByMonth,
+} from "./services/calendar/calendarService.mjs";
 import {
   cleanVolunteerContacts,
   contactsForEvent,
@@ -16,6 +22,16 @@ import {
   parseRosterObservations,
   prepareRosterReview,
 } from "./services/volunteers/rosterService.mjs";
+import {
+  createNote,
+  hasNoteContent,
+  mergeNotes,
+  migrateLegacyTopic,
+  normalizeNotes,
+  noteDisplayTitle,
+  removeNoteById,
+  searchNotes,
+} from "./services/notes/noteService.mjs";
 import {
   getStoredAuthToken,
   removeStoredAuthToken,
@@ -35,6 +51,10 @@ const tasks = [
 const APP_CONFIG = window.KEYMAN_CONFIG || {};
 const AUTH_API_BASE = String(APP_CONFIG.authApiBase || "").replace(/\/+$/, "");
 const PRIVACY_POLICY_URL = APP_CONFIG.privacyPolicyUrl || "";
+const initialLocalNotes = migrateLegacyTopic({
+  notes: readStore("keyman-notes", []),
+  topic: readStore("keyman-topic", ""),
+});
 
 const state = {
   authEmail: localStorage.getItem("keyman-auth-email") || "",
@@ -58,6 +78,10 @@ const state = {
   selectedLocation: null,
   selectedShift: null,
   selectedRotationDuration: 30,
+  primaryOnly: false,
+  rotationView: "setup",
+  rotationOrigin: "home",
+  scheduleEditing: false,
   selectedDate: todayISO(),
   volunteerContacts: [],
   rosterReview: [],
@@ -68,11 +92,18 @@ const state = {
   message: "",
   events: normalizeEvents(readStore("keyman-events", [])),
   checks: readStore("keyman-checks", {}),
-  topic: readStore("keyman-topic", ""),
+  notes: initialLocalNotes.notes,
+  notesView: "list",
+  activeNoteId: null,
+  noteSearch: "",
+  noteSaveStatus: "saved",
+  noteSwipeId: null,
   expanded: {},
   search: "",
   checklistSwipeId: null,
   calendarDate: todayISO(),
+  calendarMonth: monthStartISO(todayISO()),
+  calendarCreateOpen: false,
   calendarEventId: null,
   calendarEditing: false,
   calendarDraft: [],
@@ -89,7 +120,11 @@ const weatherByLocation = new Map(locationPages.map((location) => [
 ]));
 let toastTimer = null;
 let appDataSyncTimer = null;
+let noteAutosaveTimer = null;
 let sessionValidationPromise = null;
+
+writeStore("keyman-notes", state.notes);
+writeStore("keyman-topic", "");
 
 weatherByLocation.forEach((weather, locationId) => {
   weather.subscribe(() => {
@@ -110,16 +145,27 @@ nav.addEventListener("click", (event) => {
   state.rosterSourceOpen = false;
   state.rosterBusy = false;
   state.selectedRotationDuration = 30;
+  state.primaryOnly = false;
+  state.rotationView = "setup";
+  state.rotationOrigin = "home";
+  state.scheduleEditing = false;
   state.homeView = "shifts";
+  state.notesView = "list";
+  state.activeNoteId = null;
+  state.noteSearch = "";
+  state.noteSaveStatus = "saved";
+  state.noteSwipeId = null;
   state.profileView = "settings";
   state.profileMessage = "";
   state.calendarEventId = null;
+  state.calendarCreateOpen = false;
   state.calendarEditing = false;
   state.calendarEditMessage = "";
   window.location.hash = state.tab === "home" ? "" : state.tab;
   state.message = "";
   updateNav();
   render();
+  window.scrollTo(0, 0);
 });
 
 function render() {
@@ -132,8 +178,7 @@ function render() {
   else if (state.tab === "checklist") renderChecklist();
   else if (state.tab === "profile") renderProfile();
   else if (state.selectedShift) renderBuilder();
-  else if (state.homeView === "topic") renderTopicScreen();
-  else if (state.homeView === "emergency") renderEmergencyPlanScreen();
+  else if (state.homeView === "notes") renderNotesScreen();
   else renderHome();
 }
 
@@ -141,15 +186,29 @@ function updateNav() {
   shell.dataset.auth = state.authenticated ? "unlocked" : "locked";
   shell.dataset.tab = state.tab;
   document.querySelectorAll(".nav-item").forEach((item) => {
-    item.classList.toggle("is-active", item.dataset.tab === state.tab);
+    const isActive = item.dataset.tab === state.tab;
+    item.classList.toggle("is-active", isActive);
+    if (isActive) item.setAttribute("aria-current", "page");
+    else item.removeAttribute("aria-current");
   });
 }
 
 function updateShellSurface() {
-  const isMintPage = state.authenticated && state.tab === "home" && (state.selectedShift || state.homeView === "shifts");
-  const surface = !state.authenticated ? "auth" : isMintPage ? "mint" : "paper";
-  const color = surface === "auth" ? "#ffffff" : surface === "mint" ? "#dff3ec" : "#f6faf8";
+  const isRotationFlow = state.authenticated && state.tab === "home" && Boolean(state.selectedShift);
+  const isNotesEditor = state.authenticated
+    && state.tab === "home"
+    && state.homeView === "notes"
+    && state.notesView === "editor";
+  const isMintPage = state.authenticated && state.tab === "home" && state.homeView === "shifts";
+  const isNotesPage = state.authenticated
+    && state.tab === "home"
+    && state.homeView === "notes";
+  const isWhitePage = state.authenticated && (state.tab === "calendar" || isNotesPage);
+  const surface = !state.authenticated ? "auth" : isRotationFlow ? "rotation" : isMintPage ? "mint" : isWhitePage ? "white" : "paper";
+  const color = surface === "auth" || surface === "rotation" || surface === "white" ? "#ffffff" : surface === "mint" ? "#dff3ec" : "#f6faf8";
   shell.dataset.surface = surface;
+  shell.dataset.rotationFlow = isRotationFlow ? "active" : "inactive";
+  shell.dataset.notesEditor = isNotesEditor ? "active" : "inactive";
   document.documentElement.style.setProperty("--native-status-surface", color);
   updateNativeStatusBar(color);
 }
@@ -471,11 +530,11 @@ function renderPrivacyPolicy() {
       </div>
       <article class="privacy-card">
         <h2>Information used by the app</h2>
-        <p>The app stores your email address for sign in, volunteer names and phone numbers, rotation schedules, checklist progress, and discussion notes needed for shift planning.</p>
+        <p>The app stores your email address for sign in, volunteer names and phone numbers, rotation schedules, checklist progress, and notes you create for shift planning.</p>
         <h2>Roster image recognition</h2>
         <p>Roster screenshots and images are selected by you and processed on your device to recognize names and phone numbers. Keyman Assistant does not upload or retain the source image. You review recognized information before adding it to a shift.</p>
         <h2>How it is stored</h2>
-        <p>Confirmed volunteer contact information, schedules, checklist information, and discussion information are saved to the Keyman Assistant backend for your account and cached on this device. Passwords are stored as salted hashes.</p>
+        <p>Confirmed volunteer contact information, schedules, checklist information, and user notes are saved to the Keyman Assistant backend for your account and cached on this device. Passwords are stored as salted hashes.</p>
         <h2>Sharing</h2>
         <p>Keyman Assistant does not sell personal information. Data is used only to support account access and shift planning. When you create a group message, recipients may see one another’s phone numbers; the app warns you before opening Messages, and you decide whether to send.</p>
         <h2>Account deletion</h2>
@@ -516,27 +575,47 @@ function renderHome() {
     card.addEventListener("click", () => {
       const location = findLocationById(card.dataset.location);
       const shift = location.shifts.find((item) => item.id === card.dataset.shift);
-      state.selectedLocation = location;
-      state.selectedShift = shift;
-      state.selectedRotationDuration = 30;
-      state.selectedDate = todayISO();
-      state.volunteerContacts = Array.from({ length: shift.slots }, () => createVolunteerContact());
-      state.rosterReview = [];
-      state.rosterReviewOpen = false;
-      state.rosterSourceOpen = false;
-      state.rosterBusy = false;
-      state.schedule = createSchedule([], shift, state.selectedRotationDuration);
-      state.message = "";
-      renderBuilder();
+      if (shift) beginRotationFlow(location, shift, todayISO(), "home");
     });
   });
 
   app.querySelectorAll(".quick-action-card").forEach((card) => {
     card.addEventListener("click", () => {
       state.homeView = card.dataset.action;
+      if (state.homeView === "notes") {
+        state.notesView = "list";
+        state.activeNoteId = null;
+        state.noteSearch = "";
+        state.noteSwipeId = null;
+      }
       render();
+      window.scrollTo(0, 0);
     });
   });
+}
+
+function beginRotationFlow(location, shift, date, origin = "home") {
+  state.selectedLocation = location;
+  state.selectedShift = shift;
+  state.selectedRotationDuration = 30;
+  state.primaryOnly = false;
+  state.rotationView = "setup";
+  state.rotationOrigin = origin === "calendar" ? "calendar" : "home";
+  state.scheduleEditing = false;
+  state.selectedDate = date || todayISO();
+  state.volunteerContacts = Array.from({ length: shift.slots }, () => createVolunteerContact());
+  state.rosterReview = [];
+  state.rosterReviewOpen = false;
+  state.rosterSourceOpen = false;
+  state.rosterBusy = false;
+  state.schedule = null;
+  state.message = "";
+  state.calendarCreateOpen = false;
+  state.tab = "home";
+  window.location.hash = "";
+  updateNav();
+  renderBuilder();
+  window.scrollTo(0, 0);
 }
 
 function attachLocationPaging() {
@@ -717,188 +796,428 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
 }
 
-function renderTopicScreen() {
-  app.className = "app action-screen";
+function renderNotesScreen() {
+  updateShellSurface();
+  if (state.notesView === "editor" && state.activeNoteId) {
+    renderNoteEditor();
+    return;
+  }
+  renderNotesList();
+}
+
+function renderNotesList() {
+  state.notesView = "list";
+  app.className = "app action-screen notes-screen";
   app.innerHTML = `
-    <section class="screen">
-      <div class="topbar">
-        <button class="icon-btn" id="backToHome" aria-label="Back to home">
+    <section class="screen notes-page">
+      <header class="notes-header">
+        <button class="icon-btn" id="backToHome" type="button" aria-label="Back to home">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
         </button>
         <div>
-          <h1>Topic for discussion</h1>
-          <p class="subtle">Paste the discussion topic for this shift.</p>
+          <h1>Notes</h1>
+          <p class="subtle">Keep shift reminders and ideas together.</p>
         </div>
-      </div>
-      <label class="topic-editor-label">
-        <span>Discussion topic</span>
-        <textarea id="topicEditor" class="topic-editor" placeholder="Paste or type the topic of discussion here.">${escapeText(state.topic)}</textarea>
+        <button class="notes-new-btn" id="newNote" type="button" aria-label="New Note">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg>
+          <span class="notes-new-label-full">New Note</span>
+          <span class="notes-new-label-short" aria-hidden="true">New</span>
+        </button>
+      </header>
+      <label class="notes-search">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-4-4"></path></svg>
+        <span class="sr-only">Search notes</span>
+        <input id="noteSearch" type="search" value="${escapeAttr(state.noteSearch)}" placeholder="Search notes" autocomplete="off">
       </label>
-      <button class="primary-btn" id="saveTopic">Save topic</button>
+      <div class="notes-list" id="notesList"></div>
     </section>
   `;
 
   app.querySelector("#backToHome").addEventListener("click", () => {
     state.homeView = "shifts";
-    renderHome();
+    state.noteSearch = "";
+    state.noteSwipeId = null;
+    render();
+    window.scrollTo(0, 0);
   });
-
-  app.querySelector("#topicEditor").addEventListener("input", (event) => {
-    state.topic = event.target.value;
-    persistAppData();
+  app.querySelector("#newNote").addEventListener("click", openNewNote);
+  app.querySelector("#noteSearch").addEventListener("input", (event) => {
+    state.noteSearch = event.target.value;
+    state.noteSwipeId = null;
+    renderNotesResults();
   });
+  renderNotesResults();
+}
 
-  app.querySelector("#saveTopic").addEventListener("click", () => {
-    state.topic = app.querySelector("#topicEditor").value;
-    persistAppData();
-    showToast("Topic saved");
+function renderNotesResults() {
+  const list = app.querySelector("#notesList");
+  if (!list) return;
+  const notes = searchNotes(state.notes, state.noteSearch);
+  if (!notes.length) {
+    const searching = Boolean(state.noteSearch.trim());
+    list.innerHTML = `
+      <div class="notes-empty">
+        <span class="notes-empty-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"></path><path d="M14 3v6h6"></path><path d="M8 14h8M8 18h5"></path></svg>
+        </span>
+        <h2>${searching ? "No matching notes" : "No notes yet"}</h2>
+        <p>${searching ? "Try a different word or phrase." : "Create a note for reminders, ideas, or anything you need during a shift."}</p>
+        ${searching ? "" : `<button class="primary-btn" id="emptyNewNote" type="button">Create your first note</button>`}
+      </div>
+    `;
+    app.querySelector("#emptyNewNote")?.addEventListener("click", openNewNote);
+    return;
+  }
+
+  list.innerHTML = notes.map(renderNoteCard).join("");
+  list.querySelectorAll(".note-card-open").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.noteId;
+      if (state.noteSwipeId === id) {
+        setNoteSwipeOpen(null);
+        return;
+      }
+      openNote(id);
+    });
+  });
+  list.querySelectorAll(".note-delete-action").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const note = state.notes.find((item) => item.id === button.dataset.deleteNote);
+      if (!note || !confirm(`Delete “${noteDisplayTitle(note)}”? This cannot be undone.`)) return;
+      state.notes = removeNoteById(state.notes, note.id);
+      state.noteSwipeId = null;
+      await persistAppData({ immediate: true });
+      renderNotesResults();
+      showToast("Note deleted");
+    });
+  });
+  attachNoteSwipeActions();
+}
+
+function renderNoteCard(note) {
+  const preview = note.body.trim().replace(/\s+/g, " ") || "No additional text";
+  return `
+    <div class="note-card-swipe ${state.noteSwipeId === note.id ? "is-revealed" : ""}" data-note-id="${escapeAttr(note.id)}">
+      <button class="note-delete-action" data-delete-note="${escapeAttr(note.id)}" type="button" aria-label="Delete ${escapeAttr(noteDisplayTitle(note))}">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="m19 6-1 15H6L5 6"></path><path d="M10 11v5M14 11v5"></path></svg>
+        <span>Delete</span>
+      </button>
+      <article class="note-card">
+        <button class="note-card-open" type="button" data-note-id="${escapeAttr(note.id)}" aria-label="Open ${escapeAttr(noteDisplayTitle(note))}">
+          <span class="note-card-copy">
+            <strong>${escapeText(noteDisplayTitle(note))}</strong>
+            <span>${escapeText(preview)}</span>
+            <small>${escapeText(formatNoteUpdated(note.updatedAt))}</small>
+          </span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>
+        </button>
+      </article>
+    </div>
+  `;
+}
+
+function openNewNote() {
+  const note = createNote();
+  state.notes = [...state.notes, note];
+  state.activeNoteId = note.id;
+  state.notesView = "editor";
+  state.noteSaveStatus = "saved";
+  state.noteSwipeId = null;
+  renderNotesScreen();
+  app.querySelector("#noteTitle")?.focus();
+}
+
+function openNote(id) {
+  if (!state.notes.some((note) => note.id === id)) return;
+  state.activeNoteId = id;
+  state.notesView = "editor";
+  state.noteSaveStatus = "saved";
+  state.noteSwipeId = null;
+  renderNotesScreen();
+}
+
+function renderNoteEditor() {
+  const note = state.notes.find((item) => item.id === state.activeNoteId);
+  if (!note) {
+    state.notesView = "list";
+    state.activeNoteId = null;
+    renderNotesScreen();
+    return;
+  }
+
+  app.className = "app action-screen note-editor-screen";
+  app.innerHTML = `
+    <section class="screen note-editor-page">
+      <header class="note-editor-header">
+        <button class="note-editor-back" id="backToNotes" type="button" aria-label="Back to notes">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+        </button>
+        <span class="note-save-status" id="noteSaveStatus" role="status" aria-live="polite">${state.noteSaveStatus === "saving" ? "Saving…" : "Saved"}</span>
+        <button class="note-done-btn" id="doneNote" type="button">Done</button>
+      </header>
+      <div class="note-writing-canvas">
+        <label class="sr-only" for="noteTitle">Note title</label>
+        <input class="note-title-input" id="noteTitle" type="text" value="${escapeAttr(note.title)}" placeholder="Title" autocomplete="off">
+        <div class="note-editor-divider"></div>
+        <label class="sr-only" for="noteBody">Note text</label>
+        <textarea class="note-body-input" id="noteBody" placeholder="Start writing…" spellcheck="true">${escapeText(note.body)}</textarea>
+      </div>
+    </section>
+  `;
+
+  const updateNote = () => {
+    const title = app.querySelector("#noteTitle")?.value || "";
+    const body = app.querySelector("#noteBody")?.value || "";
+    const updatedAt = new Date().toISOString();
+    state.notes = state.notes.map((item) => (
+      item.id === note.id ? { ...item, title, body, updatedAt } : item
+    ));
+    scheduleNoteAutosave();
+  };
+  app.querySelector("#noteTitle").addEventListener("input", updateNote);
+  app.querySelector("#noteBody").addEventListener("input", updateNote);
+  app.querySelector("#backToNotes").addEventListener("click", finishNoteEditing);
+  app.querySelector("#doneNote").addEventListener("click", finishNoteEditing);
+}
+
+function scheduleNoteAutosave() {
+  saveAppDataLocal();
+  clearTimeout(noteAutosaveTimer);
+  setNoteSaveStatus("saving");
+  noteAutosaveTimer = setTimeout(async () => {
+    await persistAppData({ immediate: true });
+    setNoteSaveStatus("saved");
+  }, 500);
+}
+
+async function finishNoteEditing() {
+  const back = app.querySelector("#backToNotes");
+  const done = app.querySelector("#doneNote");
+  if (back?.disabled || done?.disabled) return;
+  if (back) back.disabled = true;
+  if (done) done.disabled = true;
+  clearTimeout(noteAutosaveTimer);
+  const note = state.notes.find((item) => item.id === state.activeNoteId);
+  if (note && !hasNoteContent(note)) {
+    state.notes = removeNoteById(state.notes, note.id);
+  }
+  setNoteSaveStatus("saving");
+  await persistAppData({ immediate: true });
+  state.noteSaveStatus = "saved";
+  state.notesView = "list";
+  state.activeNoteId = null;
+  renderNotesScreen();
+  window.scrollTo(0, 0);
+}
+
+function setNoteSaveStatus(status) {
+  state.noteSaveStatus = status === "saving" ? "saving" : "saved";
+  const label = app.querySelector("#noteSaveStatus");
+  if (label) label.textContent = state.noteSaveStatus === "saving" ? "Saving…" : "Saved";
+}
+
+function attachNoteSwipeActions() {
+  app.querySelectorAll(".note-card-swipe").forEach((noteShell) => {
+    const card = noteShell.querySelector(".note-card");
+    const id = noteShell.dataset.noteId;
+    let startX = 0;
+    let startY = 0;
+    let currentOffset = state.noteSwipeId === id ? -84 : 0;
+    let dragging = false;
+    let suppressNextClick = false;
+
+    card.addEventListener("pointerdown", (event) => {
+      startX = event.clientX;
+      startY = event.clientY;
+      currentOffset = state.noteSwipeId === id ? -84 : 0;
+      dragging = false;
+      card.setPointerCapture?.(event.pointerId);
+    });
+    card.addEventListener("pointermove", (event) => {
+      if (!startX) return;
+      const deltaX = event.clientX - startX;
+      const deltaY = event.clientY - startY;
+      if (!dragging && Math.abs(deltaY) > Math.abs(deltaX)) return;
+      if (Math.abs(deltaX) < 8) return;
+      dragging = true;
+      if (event.cancelable) event.preventDefault();
+      card.style.transform = `translateX(${clamp(currentOffset + deltaX, -84, 0)}px)`;
+    });
+    card.addEventListener("pointerup", (event) => {
+      if (!startX) return;
+      const deltaX = event.clientX - startX;
+      startX = 0;
+      if (!dragging) return;
+      suppressNextClick = true;
+      const shouldReveal = currentOffset + deltaX < -42;
+      card.style.removeProperty("transform");
+      setNoteSwipeOpen(shouldReveal ? id : null);
+    });
+    card.addEventListener("pointercancel", () => {
+      startX = 0;
+      card.style.removeProperty("transform");
+      setNoteSwipeOpen(state.noteSwipeId);
+    });
+    card.addEventListener("click", (event) => {
+      if (!suppressNextClick) return;
+      suppressNextClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+    }, true);
   });
 }
 
-function renderEmergencyPlanScreen() {
-  app.className = "app action-screen emergency-screen";
-  app.innerHTML = `
-    <section class="screen">
-      <div class="topbar">
-        <button class="icon-btn" id="backToHome" aria-label="Back to home">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
-        </button>
-        <div>
-          <h1>Emergency Plan</h1>
-          <p class="subtle">This file will be added after testing.</p>
-        </div>
-      </div>
-      <div class="empty-state">Emergency plan unavailable during testing.</div>
-    </section>
-  `;
-
-  app.querySelector("#backToHome").addEventListener("click", () => {
-    state.homeView = "shifts";
-    renderHome();
+function setNoteSwipeOpen(id) {
+  state.noteSwipeId = id;
+  app.querySelectorAll(".note-card-swipe").forEach((noteShell) => {
+    noteShell.classList.toggle("is-revealed", noteShell.dataset.noteId === id);
+    noteShell.querySelector(".note-card")?.style.removeProperty("transform");
   });
+}
+
+function formatNoteUpdated(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "Updated recently";
+  const today = new Date();
+  const isToday = date.toDateString() === today.toDateString();
+  if (isToday) {
+    return `Updated today at ${date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`;
+  }
+  return `Updated ${date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: date.getFullYear() === today.getFullYear() ? undefined : "numeric" })}`;
 }
 
 function renderBuilder() {
+  updateShellSurface();
+  if (state.rotationView === "review" && state.schedule && cleanNames().length) {
+    renderScheduleReview();
+    return;
+  }
+  renderRotationSetup();
+}
+
+function renderRotationSetup() {
   const shift = state.selectedShift;
   const location = state.selectedLocation || locationPages[0];
   const names = cleanNames();
-  const scheduleActionsAvailable = canUseScheduleActions(state.schedule, names);
   const pendingRosterCount = state.rosterReview.length;
   const rotationSlots = calculateRotationIntervals(
     shift.start,
     shift.end,
     state.selectedRotationDuration,
   ).length;
-  app.className = "app builder-screen";
+  const hasGeneratedSchedule = Array.isArray(state.schedule)
+    && state.schedule.length > 0
+    && names.length > 0;
+
+  app.className = "app builder-screen rotation-flow-screen rotation-setup-screen";
   app.innerHTML = `
-    <section class="screen">
-      <div class="topbar">
-        <button class="icon-btn" id="backHome" aria-label="Back to shifts">
+    <section class="screen rotation-screen">
+      <header class="rotation-flow-header">
+        <button class="icon-btn" id="backHome" type="button" aria-label="${state.rotationOrigin === "calendar" ? "Back to calendar" : "Back to shifts"}">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
         </button>
-        <div class="selected-shift-summary">
-          <span>Selected shift</span>
-          <p class="selected-location">${escapeText(location.title)}</p>
-          <h2>${shift.label}</h2>
-          <p class="subtle">${state.selectedRotationDuration}-minute rotations · ${rotationSlots} rotation slots</p>
+        <div class="rotation-flow-heading">
+          <p>${escapeText(location.title)}</p>
+          <h1>Create Rotation</h1>
+          <span>${escapeText(shift.label)} · ${rotationSlots} intervals</span>
         </div>
-      </div>
+      </header>
 
-      <label class="date-row">
-        <span class="slot-label">Shift date</span>
-        <input id="shiftDate" type="date" value="${state.selectedDate}">
-      </label>
+      <div class="rotation-setup-content">
+        <div class="rotation-setup-controls">
+          <label class="compact-control">
+            <span>Date</span>
+            <input id="shiftDate" type="date" value="${state.selectedDate}">
+          </label>
+          <label class="compact-control duration-control">
+            <span>Rotation</span>
+            <select id="rotationDuration" aria-label="Rotation length">
+              ${rotationDurations.map((duration) => `
+                <option value="${duration}" ${duration === state.selectedRotationDuration ? "selected" : ""}>${duration} min</option>
+              `).join("")}
+            </select>
+          </label>
+        </div>
 
-      <fieldset class="rotation-length">
-        <legend>Rotation Length</legend>
-        <div class="rotation-options">
-          ${rotationDurations.map((duration) => `
-            <button
-              class="rotation-option ${duration === state.selectedRotationDuration ? "is-selected" : ""}"
-              type="button"
-              data-duration="${duration}"
-              aria-pressed="${duration === state.selectedRotationDuration}"
-            >
-              <strong>${duration}</strong>
-              <span>min</span>
-            </button>
+        <label class="primary-only-option">
+          <span class="primary-only-copy">
+            <strong>Primary location only</strong>
+          </span>
+          <input id="primaryOnlyToggle" type="checkbox" role="switch" ${state.primaryOnly ? "checked" : ""}>
+          <span class="toggle-control" aria-hidden="true"></span>
+        </label>
+
+        <div class="volunteer-section-heading">
+          <div>
+            <h2>Volunteers</h2>
+            <p><strong>${names.length}</strong> of ${shift.slots} filled</p>
+          </div>
+          <button class="import-roster-action" id="${state.rosterBusy ? "cancelRosterImport" : "importRosterImage"}" type="button">
+            ${state.rosterBusy ? "Cancel import" : "Import roster"}
+          </button>
+          ${state.rosterBusy ? "" : `<input class="visually-hidden" id="rosterImageInput" type="file" accept="image/*" tabindex="-1" aria-hidden="true">`}
+          ${pendingRosterCount ? `<button class="pending-roster-btn" id="reviewPendingRoster" type="button">Review pending (${pendingRosterCount})</button>` : ""}
+        </div>
+
+        <div class="volunteer-grid">
+          ${state.volunteerContacts.map((contact, index) => `
+            <div class="volunteer-row">
+              <span class="volunteer-number" aria-hidden="true">${index + 1}</span>
+              <label>
+                <span class="visually-hidden">Volunteer ${index + 1} name</span>
+                <input class="name-input volunteer-contact-input" data-index="${index}" data-field="name" value="${escapeAttr(contact.name)}" placeholder="Name" aria-label="Volunteer ${index + 1} name">
+              </label>
+              <label>
+                <span class="visually-hidden">Volunteer ${index + 1} phone number</span>
+                <input class="phone-input volunteer-contact-input" data-index="${index}" data-field="phone" type="tel" inputmode="tel" autocomplete="tel" value="${escapeAttr(contact.phone)}" placeholder="Phone (optional)" aria-label="Volunteer ${index + 1} phone number">
+              </label>
+            </div>
           `).join("")}
         </div>
-      </fieldset>
 
-      <div class="volunteer-section-heading">
-        <div>
-          <h3 class="section-title">Volunteers</h3>
-          <p class="subtle">Add contacts manually or import a roster screenshot.</p>
-        </div>
-        <button class="secondary-btn import-roster-btn" id="${state.rosterBusy ? "cancelRosterImport" : "importRosterImage"}" type="button">
-          ${state.rosterBusy ? "Cancel image import" : "Import roster image"}
-        </button>
-        ${state.rosterBusy ? "" : `<input class="visually-hidden" id="rosterImageInput" type="file" accept="image/*" tabindex="-1" aria-hidden="true">`}
-        ${pendingRosterCount ? `<button class="text-btn pending-roster-btn" id="reviewPendingRoster" type="button">Review pending (${pendingRosterCount})</button>` : ""}
-      </div>
-      <div class="volunteer-grid">
-        ${state.volunteerContacts.map((contact, index) => `
-          <div class="volunteer-field">
-            <span class="volunteer-slot-title">Volunteer ${index + 1}</span>
-            <label>
-              <span class="visually-hidden">Volunteer ${index + 1} name</span>
-              <input class="name-input volunteer-contact-input" data-index="${index}" data-field="name" value="${escapeAttr(contact.name)}" placeholder="Name" aria-label="Volunteer ${index + 1} name">
-            </label>
-            <label>
-              <span class="visually-hidden">Volunteer ${index + 1} phone number</span>
-              <input class="phone-input volunteer-contact-input" data-index="${index}" data-field="phone" type="tel" inputmode="tel" autocomplete="tel" value="${escapeAttr(contact.phone)}" placeholder="Phone number" aria-label="Volunteer ${index + 1} phone number">
-            </label>
-          </div>
-        `).join("")}
+        ${state.message ? `<p class="message" role="alert">${escapeText(state.message)}</p>` : ""}
       </div>
 
-      ${state.message ? `<p class="message">${state.message}</p>` : ""}
-
-      ${state.schedule ? renderScheduleMarkup() : ""}
-
-      <div class="builder-action">
-        <button class="primary-btn" id="generateSchedule">
-          <span>${names.length ? "Regenerate schedule" : "Create schedule"}</span>
+      <div class="rotation-sticky-actions setup-sticky-action">
+        <button class="primary-btn" id="generateSchedule" type="button">
+          ${hasGeneratedSchedule ? "Update Rotation" : "Generate Rotation"}
         </button>
-        ${scheduleActionsAvailable ? `
-          <div class="actions">
-            <button class="secondary-btn" id="sendScheduleMessage" type="button">Send message</button>
-            <button class="secondary-btn" id="saveEvent">Add to calendar</button>
-          </div>
-        ` : ""}
       </div>
     </section>
     ${state.rosterReviewOpen ? renderRosterReview() : ""}
   `;
 
   app.querySelector("#backHome").addEventListener("click", () => {
-    state.selectedShift = null;
-    state.selectedLocation = null;
-    state.selectedRotationDuration = 30;
-    state.schedule = null;
-    state.volunteerContacts = [];
-    state.rosterReview = [];
-    state.rosterReviewOpen = false;
-    state.rosterSourceOpen = false;
-    state.rosterBusy = false;
-    state.message = "";
+    const origin = state.rotationOrigin;
+    resetRotationFlow();
+    if (origin === "calendar") {
+      state.tab = "calendar";
+      window.location.hash = "calendar";
+      updateNav();
+      render();
+      window.scrollTo(0, 0);
+      return;
+    }
     renderHome();
   });
 
   app.querySelector("#shiftDate").addEventListener("change", (event) => {
     state.selectedDate = event.target.value || todayISO();
+    state.message = "";
   });
 
-  app.querySelectorAll(".rotation-option").forEach((button) => {
-    button.addEventListener("click", () => {
-      const duration = Number(button.dataset.duration);
-      if (!rotationDurations.includes(duration) || duration === state.selectedRotationDuration) return;
-      state.selectedRotationDuration = duration;
-      state.message = "";
-      state.schedule = createSchedule(cleanNames(), shift, duration);
-      renderBuilder();
-    });
+  app.querySelector("#rotationDuration").addEventListener("change", (event) => {
+    const duration = Number(event.target.value);
+    if (!rotationDurations.includes(duration)) return;
+    state.selectedRotationDuration = duration;
+    state.message = "";
+    renderBuilder();
+  });
+
+  app.querySelector("#primaryOnlyToggle").addEventListener("change", (event) => {
+    state.primaryOnly = event.target.checked;
+    state.message = "";
+    renderBuilder();
   });
 
   app.querySelectorAll(".volunteer-contact-input").forEach((input) => {
@@ -910,6 +1229,7 @@ function renderBuilder() {
         [field]: event.target.value,
       };
       state.message = "";
+      updateFilledVolunteerCount();
     });
     if (input.dataset.field === "phone") {
       input.addEventListener("change", (event) => {
@@ -934,9 +1254,8 @@ function renderBuilder() {
     const file = input.files?.[0];
     if (!file) return;
 
-    // Keep the Photos-backed input and its value alive until WebKit has read
-    // the bytes. Clearing or replacing it first can invalidate the selected
-    // file on a physical iPhone before FileReader finishes.
+    // Keep the Photos-backed input alive until WebKit has read the bytes.
+    // Replacing it first can invalidate the selected file on a physical iPhone.
     await importRosterImageFile(file);
     input.value = "";
   });
@@ -948,59 +1267,182 @@ function renderBuilder() {
   attachRosterReviewHandlers();
 
   app.querySelector("#generateSchedule").addEventListener("click", () => {
-    const names = cleanNames();
-    if (names.length === 0) {
+    const volunteerNames = cleanNames();
+    if (!volunteerNames.length) {
       state.message = "Add at least one volunteer to create a rotation.";
-      state.schedule = createSchedule([], shift, state.selectedRotationDuration);
-    } else {
-      state.message = "";
-      state.schedule = createSchedule(names, shift, state.selectedRotationDuration);
+      state.schedule = null;
+      renderBuilder();
+      return;
     }
+    state.message = "";
+    state.schedule = createSchedule(
+      volunteerNames,
+      shift,
+      state.selectedRotationDuration,
+      { primaryOnly: state.primaryOnly },
+    );
+    state.rotationView = "review";
+    state.scheduleEditing = false;
+    renderBuilder();
+    window.scrollTo(0, 0);
+  });
+}
+
+function updateFilledVolunteerCount() {
+  const count = app.querySelector(".volunteer-section-heading p");
+  if (count && state.selectedShift) {
+    count.innerHTML = `<strong>${cleanNames().length}</strong> of ${state.selectedShift.slots} filled`;
+  }
+}
+
+function renderScheduleReview() {
+  const shift = state.selectedShift;
+  const location = state.selectedLocation || locationPages[0];
+  const names = cleanNames();
+  const roles = getScheduleRoles(state.schedule);
+
+  app.className = "app builder-screen rotation-flow-screen schedule-review-screen";
+  app.innerHTML = `
+    <section class="screen rotation-screen">
+      <header class="rotation-flow-header review-header">
+        <button class="icon-btn" id="backToSetup" type="button" aria-label="Back to rotation setup">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+        </button>
+        <div class="rotation-flow-heading">
+          <p>${escapeText(location.title)}</p>
+          <h1>Rotation Schedule</h1>
+        </div>
+        <button class="schedule-edit-toggle" id="toggleScheduleEditing" type="button" aria-pressed="${state.scheduleEditing}">
+          ${state.scheduleEditing ? "Done" : "Edit"}
+        </button>
+      </header>
+
+      <div class="rotation-review-content">
+        <div class="schedule-summary" aria-label="Schedule details">
+          <span>${escapeText(formatDate(state.selectedDate))}</span>
+          <span>${escapeText(shift.label)}</span>
+          <span>${state.selectedRotationDuration} min</span>
+          ${state.primaryOnly ? "<span>Primary only</span>" : ""}
+        </div>
+
+        <div class="interval-card-list">
+          ${state.schedule.map((row, rowIndex) => `
+            <article class="interval-card">
+              <div class="interval-card-heading">
+                <span>Interval ${rowIndex + 1}</span>
+                <h2>${escapeText(formatReviewTimeRange(row.time))}</h2>
+              </div>
+              <div class="interval-assignments">
+                ${roles.map((role) => `
+                  <div class="interval-role-row">
+                    <span class="role-label role-${role}">${roleLabels[role]}</span>
+                    <div class="role-assignment">
+                      ${state.scheduleEditing
+                        ? (row.assignments[role] || []).map((person, position) => `
+                            <select class="edit-select" data-row="${rowIndex}" data-role="${role}" data-position="${position}" aria-label="${roleLabels[role]} ${position + 1} for ${row.time}">
+                              ${names.map((name) => `<option value="${escapeAttr(name)}" ${name === person ? "selected" : ""}>${escapeText(name)}</option>`).join("")}
+                            </select>
+                          `).join("")
+                        : `<p>${(row.assignments[role] || []).map(escapeText).join(" · ") || "Unassigned"}</p>`
+                      }
+                    </div>
+                  </div>
+                `).join("")}
+              </div>
+            </article>
+          `).join("")}
+        </div>
+      </div>
+
+      <div class="rotation-sticky-actions review-sticky-actions">
+        <button class="primary-btn" id="saveEvent" type="button">Add to Calendar</button>
+        <button class="secondary-btn" id="sendScheduleMessage" type="button">Send Schedule</button>
+      </div>
+    </section>
+  `;
+
+  app.querySelector("#backToSetup").addEventListener("click", () => {
+    state.rotationView = "setup";
+    state.scheduleEditing = false;
+    state.message = "";
+    renderBuilder();
+    window.scrollTo(0, 0);
+  });
+
+  app.querySelector("#toggleScheduleEditing").addEventListener("click", () => {
+    state.scheduleEditing = !state.scheduleEditing;
     renderBuilder();
   });
 
-  if (scheduleActionsAvailable) {
-    app.querySelectorAll(".edit-select").forEach((select) => {
-      select.addEventListener("change", (event) => {
-        const { row, role, position } = event.target.dataset;
-        state.schedule[Number(row)].assignments[role][Number(position)] = event.target.value;
-      });
+  app.querySelectorAll(".edit-select").forEach((select) => {
+    select.addEventListener("change", (event) => {
+      const { row, role, position } = event.target.dataset;
+      state.schedule[Number(row)].assignments[role][Number(position)] = event.target.value;
     });
+  });
 
-    app.querySelector("#sendScheduleMessage").addEventListener("click", sendScheduleMessage);
+  app.querySelector("#sendScheduleMessage").addEventListener("click", sendScheduleMessage);
+  app.querySelector("#saveEvent").addEventListener("click", saveCurrentScheduleToCalendar);
+}
 
-    app.querySelector("#saveEvent").addEventListener("click", async () => {
-      const contacts = cleanVolunteerContacts(state.volunteerContacts);
-      const event = {
-        id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
-        date: state.selectedDate,
-        shiftId: shift.id,
-        shiftLabel: shift.label,
-        locationId: location.id,
-        locationName: location.title,
-        start: shift.start,
-        end: shift.end,
-        rotationDuration: state.selectedRotationDuration,
-        volunteers: contacts.map((contact) => contact.name),
-        volunteerContacts: contacts,
-        schedule: state.schedule,
-      };
-      state.events = [event, ...state.events.filter((item) => !(item.date === event.date && item.shiftId === event.shiftId && (item.locationId || locationPages[0].id) === event.locationId))];
-      state.checks[event.id] = state.checks[event.id] || Array.from({ length: tasks.length }, () => false);
-      await persistAppData({ immediate: true });
-      state.tab = "calendar";
-      state.selectedShift = null;
-      state.selectedRotationDuration = 30;
-      state.schedule = null;
-      state.volunteerContacts = [];
-      state.rosterReview = [];
-      state.rosterReviewOpen = false;
-      state.rosterSourceOpen = false;
-      updateNav();
-      renderCalendar();
-      showToast("Rotation added to calendar");
-    });
-  }
+function formatReviewTimeRange(range) {
+  return String(range)
+    .replace(/am/g, "a")
+    .replace(/pm/g, "p")
+    .replace(/\s+-\s+/, " – ");
+}
+
+async function saveCurrentScheduleToCalendar() {
+  if (!state.schedule || !state.selectedShift) return;
+  const shift = state.selectedShift;
+  const location = state.selectedLocation || locationPages[0];
+  const contacts = cleanVolunteerContacts(state.volunteerContacts);
+  const event = {
+    id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
+    date: state.selectedDate,
+    shiftId: shift.id,
+    shiftLabel: shift.label,
+    locationId: location.id,
+    locationName: location.title,
+    start: shift.start,
+    end: shift.end,
+    rotationDuration: state.selectedRotationDuration,
+    primaryOnly: state.primaryOnly,
+    volunteers: contacts.map((contact) => contact.name),
+    volunteerContacts: contacts,
+    schedule: state.schedule,
+  };
+  state.events = [event, ...state.events.filter((item) => !(item.date === event.date && item.shiftId === event.shiftId && (item.locationId || locationPages[0].id) === event.locationId))];
+  state.checks[event.id] = state.checks[event.id] || Array.from({ length: tasks.length }, () => false);
+  await persistAppData({ immediate: true });
+  state.tab = "calendar";
+  state.calendarDate = event.date;
+  state.calendarMonth = monthStartISO(event.date);
+  state.calendarCreateOpen = false;
+  resetRotationFlow();
+  window.location.hash = "calendar";
+  updateNav();
+  render();
+  window.scrollTo(0, 0);
+  showToast("Rotation added to calendar");
+}
+
+function resetRotationFlow() {
+  state.selectedShift = null;
+  state.selectedLocation = null;
+  state.selectedRotationDuration = 30;
+  state.primaryOnly = false;
+  state.rotationView = "setup";
+  state.rotationOrigin = "home";
+  state.scheduleEditing = false;
+  state.schedule = null;
+  state.volunteerContacts = [];
+  state.rosterReview = [];
+  state.rosterReviewOpen = false;
+  state.rosterSourceOpen = false;
+  state.rosterBusy = false;
+  state.message = "";
+  updateShellSurface();
 }
 
 function renderRosterReview() {
@@ -1228,7 +1670,12 @@ function applyRosterReview() {
     .filter((contact) => !contact.selected)
     .map((contact) => ({ ...contact, selected: false }));
   state.rosterReviewOpen = false;
-  state.schedule = createSchedule(cleanNames(), state.selectedShift, state.selectedRotationDuration);
+  state.schedule = createSchedule(
+    cleanNames(),
+    state.selectedShift,
+    state.selectedRotationDuration,
+    { primaryOnly: state.primaryOnly },
+  );
   const pending = state.rosterReview.length;
   state.message = `Added ${selected.length} volunteer${selected.length === 1 ? "" : "s"}.${pending ? ` ${pending} result${pending === 1 ? " remains" : "s remain"} pending.` : ""}`;
   renderBuilder();
@@ -1264,35 +1711,6 @@ function showToast(message) {
   toastTimer = setTimeout(() => {
     toast.classList.remove("is-visible");
   }, 3000);
-}
-
-function renderScheduleMarkup() {
-  const names = cleanNames();
-  if (!names.length) return "";
-  const roles = getScheduleRoles(state.schedule);
-  return `
-    <h3 class="section-title">Rotation Schedule</h3>
-    <div class="schedule-card">
-      <div class="rotation-head ${roles.length === 2 ? "is-compact" : ""}">
-        <div>Time</div>
-        ${roles.map((role) => `<div>${roleLabels[role]}</div>`).join("")}
-      </div>
-      ${state.schedule.map((row, rowIndex) => `
-        <div class="rotation-row ${roles.length === 2 ? "is-compact" : ""}">
-          <div class="time-cell">${row.time}</div>
-          ${roles.map((role) => `
-            <div class="assignment">
-              ${(row.assignments[role] || []).map((person, position) => `
-                <select class="edit-select" data-row="${rowIndex}" data-role="${role}" data-position="${position}" aria-label="${role} ${position + 1} for ${row.time}">
-                  ${names.map((name) => `<option value="${escapeAttr(name)}" ${name === person ? "selected" : ""}>${name}</option>`).join("")}
-                </select>
-              `).join("")}
-            </div>
-          `).join("")}
-        </div>
-      `).join("")}
-    </div>
-  `;
 }
 
 const roleLabels = {
@@ -1410,88 +1828,186 @@ function getScheduleRoles(schedule) {
 }
 
 function renderCalendar() {
-  app.className = "app";
-  const now = new Date();
   const activeDate = state.calendarDate || todayISO();
-  const monthEvents = state.events.filter((event) => {
-    const date = new Date(`${event.date}T12:00:00`);
-    return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
+  const displayMonth = state.calendarMonth || monthStartISO(activeDate);
+  const monthEvents = eventsForMonth(state.events, displayMonth);
+  const dayEvents = eventsForDate(state.events, activeDate);
+  const monthTitle = new Date(`${displayMonth}T12:00:00`).toLocaleDateString(undefined, {
+    month: "long",
+    year: "numeric",
   });
 
+  app.className = "app calendar-screen";
+
   app.innerHTML = `
-    <section class="screen">
-      <div class="topbar">
-        <div>
-          <h1>Calendar</h1>
-          <p class="subtle">Saved rotations appear in their shift time block.</p>
+    <section class="screen calendar-page">
+      <header class="calendar-topbar">
+        <h1>Calendar</h1>
+        <button class="calendar-today-btn" id="calendarToday" type="button">Today</button>
+      </header>
+
+      <div class="calendar-month">
+        <div class="calendar-month-nav">
+          <button class="calendar-month-btn" id="previousCalendarMonth" type="button" aria-label="Previous month">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+          </button>
+          <h2>${escapeText(monthTitle)}</h2>
+          <button class="calendar-month-btn" id="nextCalendarMonth" type="button" aria-label="Next month">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+          </button>
         </div>
-      </div>
-      <div class="calendar-wrap">
-        <div class="calendar-header">
-          <h2>${now.toLocaleString(undefined, { month: "long", year: "numeric" })}</h2>
-          <span class="subtle">${monthEvents.length} rotation${monthEvents.length === 1 ? "" : "s"}</span>
-        </div>
-        <div class="month-grid">
+
+        <div class="month-grid" role="grid" aria-label="${escapeAttr(monthTitle)}">
           ${["S", "M", "T", "W", "T", "F", "S"].map((day) => `<div class="weekday">${day}</div>`).join("")}
-          ${renderMonthCells(now, monthEvents)}
+          ${renderMonthCells(displayMonth, monthEvents)}
         </div>
-        ${renderTimeline(state.events, activeDate)}
       </div>
+
+      <section class="calendar-agenda" aria-labelledby="calendarAgendaTitle">
+        <div class="calendar-agenda-heading">
+          <h2 id="calendarAgendaTitle">${escapeText(formatCalendarDayHeading(activeDate))}</h2>
+          <span>${dayEvents.length} rotation${dayEvents.length === 1 ? "" : "s"}</span>
+        </div>
+        <div class="calendar-agenda-list">
+          ${dayEvents.length
+            ? dayEvents.map(renderCalendarAgendaCard).join("")
+            : `<p class="calendar-agenda-empty">No rotations scheduled</p>`
+          }
+        </div>
+        <button class="calendar-create-btn" id="openCalendarCreate" type="button">
+          <span aria-hidden="true">+</span> Create Rotation
+        </button>
+      </section>
+
       ${state.calendarEventId ? renderCalendarEventSheet() : ""}
+      ${state.calendarCreateOpen ? renderCalendarCreatePicker() : ""}
     </section>
   `;
 
   attachCalendarHandlers();
 }
 
-function renderTimeline(events, activeDate) {
-  const visible = events
-    .slice()
-    .filter((event) => event.date === activeDate)
-    .sort((a, b) => a.start.localeCompare(b.start));
-  const startMinute = 9 * 60;
-  const endMinute = 20 * 60;
-  const hourHeight = 58;
-  const totalHeight = ((endMinute - startMinute) / 60) * hourHeight;
+function formatCalendarDayHeading(iso) {
+  return new Date(`${iso}T12:00:00`).toLocaleDateString(undefined, {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+}
 
+function renderCalendarAgendaCard(event) {
+  const contacts = contactsForEvent(event).filter((contact) => contact.name);
+  const volunteerCount = contacts.length || (Array.isArray(event.volunteers) ? event.volunteers.filter(Boolean).length : 0);
+  const roles = getScheduleRoles(event.schedule)
+    .filter((role) => !event.primaryOnly || role !== "secondary")
+    .map((role) => roleLabels[role]);
+  const duration = Number(event.rotationDuration) || 30;
   return `
-    <div class="timeline-wrap">
-      <div class="timeline-title">
-        <h3>${formatDate(activeDate)}</h3>
-        <span class="subtle">${visible.length} block${visible.length === 1 ? "" : "s"}</span>
-      </div>
-      <div class="day-timeline" style="height:${totalHeight}px">
-        ${Array.from({ length: (endMinute - startMinute) / 60 + 1 }, (_, index) => {
-          const minute = startMinute + index * 60;
-          return `
-            <div class="hour-line" style="top:${index * hourHeight}px">
-              <span>${formatMinutes(minute)}</span>
-            </div>
-          `;
-        }).join("")}
-        ${visible.map((event) => {
-          const top = ((timeToMinutes(event.start) - startMinute) / 60) * hourHeight;
-          const height = ((timeToMinutes(event.end) - timeToMinutes(event.start)) / 60) * hourHeight;
-          const overlapping = visible.filter((item) => item.start === event.start && item.end === event.end);
-          const overlapIndex = overlapping.findIndex((item) => item.id === event.id);
-          const blockWidth = overlapping.length > 1 ? `calc(${100 / overlapping.length}% - 12px)` : "calc(100% - 12px)";
-          const blockLeft = overlapping.length > 1 ? `calc(12px + ${(100 / overlapping.length) * overlapIndex}%)` : "12px";
-          return `
-            <button class="time-block" type="button" data-event-id="${escapeAttr(event.id)}" style="top:${top}px; height:${height}px; left:${blockLeft}; width:${blockWidth}">
-              <strong>Shift rotation</strong>
-              <span>${event.locationName ? `${escapeText(event.locationName)} · ` : ""}${event.shiftLabel}</span>
-            </button>
-          `;
-        }).join("")}
-      </div>
+    <button class="calendar-agenda-card" type="button" data-event-id="${escapeAttr(event.id)}" aria-label="View ${escapeAttr(event.locationName || "shift rotation")} from ${escapeAttr(formatCalendarEventTime(event))}">
+      <span class="calendar-agenda-accent" aria-hidden="true"></span>
+      <span class="calendar-agenda-card-copy">
+        <strong class="calendar-agenda-time">${escapeText(formatCalendarEventTime(event))}</strong>
+        <span class="calendar-agenda-location">${escapeText(event.locationName || "Shift rotation")}</span>
+        <span class="calendar-agenda-meta">${volunteerCount} volunteer${volunteerCount === 1 ? "" : "s"} · ${duration} min</span>
+        <span class="calendar-agenda-roles">${escapeText(roles.join(" · "))}</span>
+      </span>
+      <svg class="calendar-agenda-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+    </button>
+  `;
+}
+
+function formatCalendarEventTime(event) {
+  if (event.start && event.end) {
+    const range = `${formatMinutes(timeToMinutes(event.start))} - ${formatMinutes(timeToMinutes(event.end))}`;
+    return formatReviewTimeRange(range);
+  }
+  return formatReviewTimeRange(event.shiftLabel || "Scheduled rotation");
+}
+
+function renderCalendarCreatePicker() {
+  return `
+    <div class="calendar-create-overlay" role="dialog" aria-modal="true" aria-labelledby="calendarCreateTitle">
+      <button class="calendar-create-backdrop" id="closeCalendarCreateBackdrop" type="button" aria-label="Close shift picker"></button>
+      <article class="calendar-create-sheet">
+        <span class="calendar-create-handle" aria-hidden="true"></span>
+        <header class="calendar-create-header">
+          <div>
+            <p>${escapeText(formatCalendarDayHeading(state.calendarDate))}</p>
+            <h2 id="calendarCreateTitle">Create Rotation</h2>
+          </div>
+          <button class="icon-btn" id="closeCalendarCreate" type="button" aria-label="Close shift picker">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 6-12 12"></path><path d="m6 6 12 12"></path></svg>
+          </button>
+        </header>
+        <div class="calendar-create-locations">
+          ${locationPages.map((location) => `
+            <section class="calendar-create-location">
+              <h3>${escapeText(location.title)}</h3>
+              <div class="calendar-create-shifts">
+                ${location.shifts.map((shift) => `
+                  <button class="calendar-shift-option" type="button" data-location="${escapeAttr(location.id)}" data-shift="${escapeAttr(shift.id)}">
+                    <span>${escapeText(shift.shortLabel || formatReviewTimeRange(shift.label))}</span>
+                    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+                  </button>
+                `).join("")}
+              </div>
+            </section>
+          `).join("")}
+        </div>
+      </article>
     </div>
   `;
 }
 
+function closeCalendarCreatePicker() {
+  state.calendarCreateOpen = false;
+  renderCalendar();
+  app.querySelector("#openCalendarCreate")?.focus();
+}
+
+function moveCalendarMonth(monthDelta) {
+  const nextDate = shiftCalendarDateByMonth(state.calendarDate || todayISO(), monthDelta);
+  if (!nextDate) return;
+  state.calendarDate = nextDate;
+  state.calendarMonth = monthStartISO(nextDate);
+  state.calendarEventId = null;
+  state.calendarEditing = false;
+  state.calendarEditMessage = "";
+  renderCalendar();
+}
+
+function openCalendarEvent(eventId) {
+  const event = state.events.find((item) => item.id === eventId);
+  if (!event) return;
+  state.calendarEventId = event.id;
+  state.calendarEditing = false;
+  state.calendarDraft = contactsForEvent(event);
+  state.calendarEditMessage = "";
+  renderCalendar();
+}
+
 function attachCalendarHandlers() {
+  app.querySelector("#calendarToday")?.addEventListener("click", () => {
+    state.calendarDate = todayISO();
+    state.calendarMonth = monthStartISO(state.calendarDate);
+    state.calendarEventId = null;
+    state.calendarEditing = false;
+    state.calendarEditMessage = "";
+    renderCalendar();
+  });
+
+  app.querySelector("#previousCalendarMonth")?.addEventListener("click", () => {
+    moveCalendarMonth(-1);
+  });
+
+  app.querySelector("#nextCalendarMonth")?.addEventListener("click", () => {
+    moveCalendarMonth(1);
+  });
+
   app.querySelectorAll(".day-cell[data-date]").forEach((cell) => {
     cell.addEventListener("click", () => {
       state.calendarDate = cell.dataset.date;
+      state.calendarMonth = monthStartISO(state.calendarDate);
       state.calendarEventId = null;
       state.calendarEditing = false;
       state.calendarEditMessage = "";
@@ -1499,15 +2015,29 @@ function attachCalendarHandlers() {
     });
   });
 
-  app.querySelectorAll(".time-block").forEach((block) => {
-    block.addEventListener("click", () => {
-      const event = state.events.find((item) => item.id === block.dataset.eventId);
-      if (!event) return;
-      state.calendarEventId = event.id;
-      state.calendarEditing = false;
-      state.calendarDraft = contactsForEvent(event);
-      state.calendarEditMessage = "";
-      renderCalendar();
+  app.querySelectorAll(".calendar-agenda-card").forEach((card) => {
+    card.addEventListener("click", () => {
+      openCalendarEvent(card.dataset.eventId);
+    });
+  });
+
+  app.querySelector("#openCalendarCreate")?.addEventListener("click", () => {
+    state.calendarCreateOpen = true;
+    state.calendarEventId = null;
+    renderCalendar();
+    app.querySelector("#closeCalendarCreate")?.focus();
+  });
+
+  app.querySelector("#closeCalendarCreate")?.addEventListener("click", closeCalendarCreatePicker);
+  app.querySelector("#closeCalendarCreateBackdrop")?.addEventListener("click", closeCalendarCreatePicker);
+  app.querySelector(".calendar-create-sheet")?.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeCalendarCreatePicker();
+  });
+  app.querySelectorAll(".calendar-shift-option").forEach((button) => {
+    button.addEventListener("click", () => {
+      const location = findLocationById(button.dataset.location);
+      const shift = location.shifts.find((item) => item.id === button.dataset.shift);
+      if (shift) beginRotationFlow(location, shift, state.calendarDate, "calendar");
     });
   });
 
@@ -1698,6 +2228,7 @@ async function updateCalendarEvent(clickEvent) {
       names,
       shift,
       calendarEvent.rotationDuration || shift.minutes || 30,
+      { primaryOnly: Boolean(calendarEvent.primaryOnly) },
     ),
   };
   state.events = state.events.map((item) => (item.id === calendarEvent.id ? updatedEvent : item));
@@ -1730,28 +2261,29 @@ async function deleteCalendarEvent(clickEvent) {
   showToast("Rotation deleted");
 }
 
-function renderMonthCells(now, events) {
-  const first = new Date(now.getFullYear(), now.getMonth(), 1);
-  const last = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+function renderMonthCells(monthISO, events) {
   const eventDates = new Set(events.map((event) => event.date));
   const today = todayISO();
   const activeDate = state.calendarDate || today;
-  const cells = [];
-
-  for (let i = 0; i < first.getDay(); i += 1) {
-    cells.push(`<div class="day-cell"></div>`);
-  }
-
-  for (let day = 1; day <= last.getDate(); day += 1) {
-    const iso = toISO(new Date(now.getFullYear(), now.getMonth(), day));
-    cells.push(`
-      <button class="day-cell ${eventDates.has(iso) ? "has-event" : ""} ${iso === today ? "is-today" : ""} ${iso === activeDate ? "is-selected" : ""}" data-date="${iso}" type="button" aria-label="View ${formatDate(iso)}">
+  return calendarMonthCells(monthISO).map((iso) => {
+    if (!iso) return `<div class="day-cell is-placeholder" role="gridcell" aria-hidden="true"></div>`;
+    const day = Number(iso.slice(-2));
+    const isToday = iso === today;
+    const isSelected = iso === activeDate;
+    return `
+      <button
+        class="day-cell ${eventDates.has(iso) ? "has-event" : ""} ${isToday ? "is-today" : ""} ${isSelected ? "is-selected" : ""}"
+        data-date="${iso}"
+        type="button"
+        role="gridcell"
+        aria-label="View ${formatDate(iso)}"
+        aria-selected="${isSelected}"
+        ${isToday ? `aria-current="date"` : ""}
+      >
         <span>${day}</span>
       </button>
-    `);
-  }
-
-  return cells.join("");
+    `;
+  }).join("");
 }
 
 function renderChecklist() {
@@ -2004,29 +2536,37 @@ function getAppDataSnapshot() {
   return {
     events: state.events,
     checks: state.checks,
-    topic: state.topic,
+    notes: normalizeNotes(state.notes),
+    topic: "",
   };
 }
 
 function saveAppDataLocal() {
   writeStore("keyman-events", state.events);
   writeStore("keyman-checks", state.checks);
-  writeStore("keyman-topic", state.topic);
+  writeStore("keyman-notes", normalizeNotes(state.notes));
+  writeStore("keyman-topic", "");
 }
 
 function hasAppData(data) {
   return Boolean(
     (Array.isArray(data.events) && data.events.length)
     || (data.checks && Object.keys(data.checks).length)
+    || (Array.isArray(data.notes) && data.notes.length)
     || String(data.topic || "").trim(),
   );
 }
 
 function normalizeAppData(data = {}) {
+  const migratedNotes = migrateLegacyTopic({
+    notes: data.notes,
+    topic: data.topic,
+  });
   return {
     events: normalizeEvents(data.events),
     checks: data.checks && typeof data.checks === "object" && !Array.isArray(data.checks) ? data.checks : {},
-    topic: String(data.topic || ""),
+    notes: migratedNotes.notes,
+    topic: "",
   };
 }
 
@@ -2036,6 +2576,7 @@ function normalizeEvents(events) {
     const contacts = contactsForEvent(event);
     return {
       ...event,
+      primaryOnly: Boolean(event.primaryOnly),
       volunteers: contacts.length ? contacts.map((contact) => contact.name).filter(Boolean) : (Array.isArray(event.volunteers) ? event.volunteers : []),
       volunteerContacts: contacts,
     };
@@ -2046,19 +2587,29 @@ function applyAppData(data) {
   const normalized = normalizeAppData(data);
   state.events = normalized.events;
   state.checks = normalized.checks;
-  state.topic = normalized.topic;
+  state.notes = normalized.notes;
   saveAppDataLocal();
 }
 
 async function loadAccountData() {
   const localData = getAppDataSnapshot();
   try {
-    const remoteData = normalizeAppData(await authRequest("/api/app-data"));
+    const remoteRaw = await authRequest("/api/app-data");
+    const remoteData = normalizeAppData(remoteRaw);
     if (!hasAppData(remoteData) && hasAppData(localData)) {
       await saveAccountData(localData);
       applyAppData(localData);
     } else {
+      if (initialLocalNotes.migrated) {
+        const localLegacyNote = localData.notes.find((note) => note.id === "legacy-topic");
+        if (localLegacyNote && !remoteData.notes.some((note) => note.id === localLegacyNote.id)) {
+          remoteData.notes = mergeNotes(remoteData.notes, [localLegacyNote]);
+        }
+      }
       applyAppData(remoteData);
+      if (String(remoteRaw.topic || "").trim() || remoteData.notes.length !== normalizeNotes(remoteRaw.notes).length) {
+        await saveAccountData(remoteData);
+      }
     }
     state.appDataLoaded = true;
   } catch {
@@ -2086,20 +2637,31 @@ async function saveAccountData(data) {
 }
 
 function clearLocalAppData() {
-  ["keyman-events", "keyman-checks", "keyman-topic"].forEach((key) => localStorage.removeItem(key));
+  ["keyman-events", "keyman-checks", "keyman-notes", "keyman-topic"].forEach((key) => localStorage.removeItem(key));
   state.events = [];
   state.checks = {};
-  state.topic = "";
+  state.notes = [];
+  state.notesView = "list";
+  state.activeNoteId = null;
+  state.noteSearch = "";
+  state.noteSaveStatus = "saved";
+  state.noteSwipeId = null;
   state.expanded = {};
   state.search = "";
   state.checklistSwipeId = null;
   state.calendarDate = todayISO();
+  state.calendarMonth = monthStartISO(state.calendarDate);
+  state.calendarCreateOpen = false;
   state.calendarEventId = null;
   state.calendarEditing = false;
   state.calendarDraft = [];
   state.calendarEditMessage = "";
   state.selectedShift = null;
   state.selectedRotationDuration = 30;
+  state.primaryOnly = false;
+  state.rotationView = "setup";
+  state.rotationOrigin = "home";
+  state.scheduleEditing = false;
   state.schedule = null;
   state.volunteerContacts = [];
   state.rosterReview = [];
@@ -2123,6 +2685,7 @@ function clearAuthToken() {
 
 function clearSignedInState({ clearLocalData = false } = {}) {
   clearTimeout(appDataSyncTimer);
+  clearTimeout(noteAutosaveTimer);
   clearAuthToken();
   localStorage.removeItem("keyman-auth-email");
   if (clearLocalData) clearLocalAppData();
@@ -2143,6 +2706,14 @@ function clearSignedInState({ clearLocalData = false } = {}) {
   state.appDataLoaded = false;
   state.tab = "home";
   state.homeView = "shifts";
+  state.notesView = "list";
+  state.activeNoteId = null;
+  state.noteSearch = "";
+  state.noteSaveStatus = "saved";
+  state.noteSwipeId = null;
+  state.rotationView = "setup";
+  state.rotationOrigin = "home";
+  state.scheduleEditing = false;
   window.location.hash = "";
   updateNav();
   render();

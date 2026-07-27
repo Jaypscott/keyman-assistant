@@ -30,8 +30,15 @@ export function canUseScheduleActions(schedule, volunteerNames) {
     && volunteerNames.length > 0;
 }
 
-export function createSchedule(names, shift, duration = shift.minutes) {
-  if (names.length < 6) return createSmallCrewSchedule(names, shift, duration);
+export function createSchedule(
+  names,
+  shift,
+  duration = shift.minutes,
+  { primaryOnly = false } = {},
+) {
+  if (primaryOnly || names.length < 6) {
+    return createPrimaryInformalSchedule(names, shift, duration);
+  }
 
   const periods = calculateRotationIntervals(shift.start, shift.end, duration);
   const volunteerLimit = Number(shift.slots) >= 8 ? 8 : 6;
@@ -93,7 +100,7 @@ function formatMinutes(total) {
   return `${hour}:${String(minute).padStart(2, "0")}${suffix}`;
 }
 
-function createSmallCrewSchedule(names, shift, duration = shift.minutes) {
+function createPrimaryInformalSchedule(names, shift, duration = shift.minutes) {
   const periods = calculateRotationIntervals(shift.start, shift.end, duration);
   const primaryCounts = Object.fromEntries(names.map((name) => [name, 0]));
   const pairCounts = new Map();
@@ -102,7 +109,7 @@ function createSmallCrewSchedule(names, shift, duration = shift.minutes) {
     const ranked = names
       .slice()
       .sort((a, b) => primaryCounts[a] - primaryCounts[b] || rotateIndex(a, names, index) - rotateIndex(b, names, index));
-    const primary = chooseSmallCrewPrimary(ranked, pairCounts);
+    const primary = choosePrimaryPair(ranked, primaryCounts, pairCounts);
     primary.forEach((name) => {
       primaryCounts[name] += 1;
     });
@@ -118,7 +125,7 @@ function createSmallCrewSchedule(names, shift, duration = shift.minutes) {
   });
 }
 
-function chooseSmallCrewPrimary(ranked, pairCounts) {
+function choosePrimaryPair(ranked, primaryCounts, pairCounts) {
   if (ranked.length <= 2) return ranked;
 
   let bestPair = ranked.slice(0, 2);
@@ -126,7 +133,16 @@ function chooseSmallCrewPrimary(ranked, pairCounts) {
   for (let i = 0; i < ranked.length; i += 1) {
     for (let j = i + 1; j < ranked.length; j += 1) {
       const pair = [ranked[i], ranked[j]];
-      const score = i + j + ((pairCounts.get(pairKey(pair[0], pair[1])) || 0) * ranked.length);
+      const projectedCounts = Object.entries(primaryCounts).map(([name, count]) => (
+        pair.includes(name) ? count + 1 : count
+      ));
+      const projectedSpread = Math.max(...projectedCounts) - Math.min(...projectedCounts);
+      const repeatedPairCount = pairCounts.get(pairKey(pair[0], pair[1])) || 0;
+      const score = (projectedSpread * 1_000_000)
+        + (Math.max(...projectedCounts) * 10_000)
+        + (repeatedPairCount * 100)
+        + i
+        + j;
       if (score < bestScore) {
         bestScore = score;
         bestPair = pair;

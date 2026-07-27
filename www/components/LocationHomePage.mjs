@@ -34,10 +34,10 @@ export function renderLocationHomePage({
           </div>
           <section class="quick-actions" aria-hidden="${!quickActionsOpen}">
             <h2>Quick Actions</h2>
-            <button class="quick-action-card" data-action="emergency">
+            <button class="quick-action-card" data-action="notes">
               <span><strong class="quick-action-label">
-                <svg class="caution-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 2 21h20L12 3Z"></path><path d="M12 9v5"></path><path d="M12 17h.01"></path></svg>
-                Emergency Plan
+                <svg class="note-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Z"></path><path d="M14 3v6h6"></path><path d="m9 16 6.8-6.8 2 2L11 18H9Z"></path></svg>
+                Notes
               </strong></span>
               <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>
             </button>
@@ -70,4 +70,3 @@ function escapeAttribute(value) {
     .replaceAll("\"", "&quot;")
     .replaceAll("'", "&#039;");
 }
-

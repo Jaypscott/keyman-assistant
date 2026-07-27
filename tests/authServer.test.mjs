@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -54,6 +54,61 @@ test("password recovery works and sessions use a rolling seven-day inactivity ti
   const touchedDatabase = JSON.parse(await readFile(dataFile, "utf8"));
   assert.ok(touchedDatabase.sessions[0].expiresAt > firstExpiry);
 
+  const savedNotes = [{
+    id: "note-one",
+    title: "Arrival",
+    body: "Bring the setup signs.",
+    createdAt: "2026-07-20T13:00:00.000Z",
+    updatedAt: "2026-07-20T13:05:00.000Z",
+  }];
+  const appDataSave = await request(baseUrl, "/api/app-data", {
+    events: [],
+    checks: {},
+    notes: savedNotes,
+    topic: "",
+  }, originalToken, "PUT");
+  assert.equal(appDataSave.status, 200);
+  assert.deepEqual(appDataSave.data.notes, savedNotes);
+
+  const legacyClientSave = await request(baseUrl, "/api/app-data", {
+    events: [{ id: "legacy-event" }],
+    checks: { "legacy-event": [true] },
+    topic: "An older client value should not replace notes.",
+  }, originalToken, "PUT");
+  assert.equal(legacyClientSave.status, 200);
+  assert.deepEqual(legacyClientSave.data.notes, savedNotes);
+  assert.equal(legacyClientSave.data.topic, "");
+
+  const restoredAppData = await request(baseUrl, "/api/app-data", undefined, originalToken);
+  assert.equal(restoredAppData.status, 200);
+  assert.deepEqual(restoredAppData.data.notes, savedNotes);
+  assert.deepEqual(restoredAppData.data.events, [{ id: "legacy-event" }]);
+
+  const legacyRegistration = await request(baseUrl, "/api/auth/register", {
+    email: "legacy-topic@example.com",
+    password: "legacy-password",
+  });
+  const legacyDatabase = JSON.parse(await readFile(dataFile, "utf8"));
+  legacyDatabase.appData[legacyRegistration.data.user.id] = {
+    events: [],
+    checks: {},
+    topic: "Review the legacy discussion topic.",
+  };
+  await writeFile(dataFile, JSON.stringify(legacyDatabase, null, 2));
+  const migratedAppData = await request(
+    baseUrl,
+    "/api/app-data",
+    undefined,
+    legacyRegistration.data.token,
+  );
+  assert.equal(migratedAppData.status, 200);
+  assert.equal(migratedAppData.data.topic, "");
+  assert.equal(migratedAppData.data.notes.length, 1);
+  assert.equal(migratedAppData.data.notes[0].title, "Discussion Topic");
+  assert.equal(migratedAppData.data.notes[0].body, "Review the legacy discussion topic.");
+  const migratedDatabase = JSON.parse(await readFile(dataFile, "utf8"));
+  assert.equal(migratedDatabase.appData[legacyRegistration.data.user.id].topic, "");
+
   const unknownReset = await request(baseUrl, "/api/auth/password-reset/request", {
     email: "nobody@example.com",
   });
@@ -79,9 +134,9 @@ test("password recovery works and sessions use a rolling seven-day inactivity ti
   assert.equal(newLogin.status, 200);
 });
 
-async function request(baseUrl, path, body, token = "") {
+async function request(baseUrl, path, body, token = "", method = body ? "POST" : "GET") {
   const response = await fetch(`${baseUrl}${path}`, {
-    method: body ? "POST" : "GET",
+    method,
     headers: {
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
