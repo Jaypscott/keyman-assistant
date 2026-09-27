@@ -22,6 +22,7 @@
     "pg": "^8.21.0"
   },
   "devDependencies": {
-    "@capacitor/cli": "^7.0.0"
+    "@capacitor/cli": "^7.0.0",
+    "jsdom": "^26.1.0"
   }
 }

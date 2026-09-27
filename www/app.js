@@ -1,3 +1,4 @@
+import { createPasswordResetDraft, remainingResetSeconds, validatePasswordReset } from "./services/auth/passwordResetState.mjs";
 import { renderWeatherCard, renderWeatherPullIndicator } from "./components/WeatherCard.mjs";
 import { renderLocationHomePage, renderLocationPageIndicator } from "./components/LocationHomePage.mjs";
 import { createWeatherController } from "./hooks/useWeather.mjs";
@@ -66,6 +67,7 @@ const state = {
   authView: "signin",
   authMessage: "",
   authMessageType: "error",
+  passwordResetDraft: createPasswordResetDraft(),
   passwordResetEmail: "",
   passwordResetDevelopmentCode: "",
   profileView: "settings",
@@ -253,6 +255,7 @@ function renderAuth() {
     renderAuth();
   });
   app.querySelector("#forgotPassword")?.addEventListener("click", () => {
+    state.passwordResetDraft = createPasswordResetDraft();
     state.authView = "forgot-email";
     state.passwordResetEmail = state.authEmail;
     state.passwordResetDevelopmentCode = "";
@@ -262,157 +265,200 @@ function renderAuth() {
   });
 }
 
+let passwordResetTimer;
 function renderPasswordReset() {
+  clearInterval(passwordResetTimer);
+  const draft = state.passwordResetDraft;
   const isPasswordStep = state.authView === "forgot-password";
+  const busy = state.authBusy ? "disabled" : "";
+  const errorAttributes = (field) => `aria-invalid="${Boolean(draft.errors[field])}" aria-describedby="reset-${field}-error"`;
+  const fieldError = (field) => `<span id="reset-${field}-error" class="reset-field-error">${escapeText(draft.errors[field] || "")}</span>`;
   app.className = "app auth-app";
   app.innerHTML = `
     <section class="auth-screen">
       <img class="auth-logo auth-logo-small" src="assets/auth-logo.png" alt="Keyman app logo">
       <div class="auth-card password-reset-card">
-        <div>
-          <h1>${isPasswordStep ? "Create new password" : "Forgot Password"}</h1>
+        <div><h1>${isPasswordStep ? "Create new password" : "Forgot password?"}</h1>
           <p class="auth-copy">${isPasswordStep
-            ? `Enter the code sent to ${escapeText(state.passwordResetEmail)} and choose a new password.`
-            : "Enter the email address associated with your account."}</p>
-        </div>
+            ? `Use the six-digit code emailed to ${escapeText(state.passwordResetEmail)}. Check your spam folder too.`
+            : "Enter your account email and we’ll send you a reset code."}</p></div>
         ${isPasswordStep ? `
-          <form id="passwordResetForm" class="auth-form" ${state.authBusy ? "aria-busy=\"true\"" : ""}>
-            <label>
-              <span>Reset code</span>
-              <input id="passwordResetCode" class="auth-input reset-code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" ${state.authBusy ? "disabled" : ""} required>
+          <form id="passwordResetForm" class="auth-form" novalidate aria-busy="${state.authBusy}">
+            <label><span>Reset code</span>
+              <input id="passwordResetCode" class="auth-input reset-code-input" inputmode="numeric" autocomplete="one-time-code" maxlength="6" ${errorAttributes("code")} ${busy} required>
+              ${fieldError("code")}
             </label>
-            <label>
-              <span>New Password</span>
-              <input id="newPassword" class="auth-input" type="password" autocomplete="new-password" minlength="6" ${state.authBusy ? "disabled" : ""} required>
+            <p id="resetExpiry" class="reset-hint">Codes expire after 15 minutes.</p>
+            <label><span>New password</span>
+              <input id="newPassword" class="auth-input" type="${draft.visible ? "text" : "password"}" autocomplete="new-password" minlength="6" ${errorAttributes("password")} ${busy} required>
+              ${fieldError("password")}
             </label>
-            <label>
-              <span>Confirm New Password</span>
-              <input id="confirmNewPassword" class="auth-input" type="password" autocomplete="new-password" minlength="6" ${state.authBusy ? "disabled" : ""} required>
+            <label><span>Confirm new password</span>
+              <input id="confirmNewPassword" class="auth-input" type="${draft.visible ? "text" : "password"}" autocomplete="new-password" minlength="6" ${errorAttributes("confirmation")} ${busy} required>
+              ${fieldError("confirmation")}
             </label>
+            <button class="auth-toggle reset-visibility" id="toggleResetPassword" type="button" aria-pressed="${draft.visible}" aria-controls="newPassword confirmNewPassword" ${busy}>${draft.visible ? "Hide passwords" : "Show passwords"}</button>
+            <p class="auth-message ${state.authMessageType === "success" ? "is-success" : ""}" role="status" aria-live="polite" aria-atomic="true">${escapeText(state.authMessage)}</p>
             ${state.passwordResetDevelopmentCode ? `<p class="development-code">Development reset code: <strong>${escapeText(state.passwordResetDevelopmentCode)}</strong></p>` : ""}
-            ${state.authMessage ? `<p class="auth-message ${state.authMessageType === "success" ? "is-success" : ""}">${escapeText(state.authMessage)}</p>` : ""}
-            <button class="primary-btn" type="submit" ${state.authBusy ? "disabled" : ""}>${state.authBusy ? "Updating password" : "Update password"}</button>
-            <button class="auth-toggle" id="resendResetCode" type="button" ${state.authBusy ? "disabled" : ""}>Send a new code</button>
-          </form>
-        ` : `
-          <form id="passwordResetEmailForm" class="auth-form" ${state.authBusy ? "aria-busy=\"true\"" : ""}>
-            <label>
-              <span>Email address</span>
-              <input id="passwordResetEmail" class="auth-input" type="email" autocomplete="email" value="${escapeAttr(state.passwordResetEmail)}" ${state.authBusy ? "disabled" : ""} required>
+            <button class="primary-btn" type="submit" ${busy}>${draft.action === "updating" ? "Updating password…" : "Update password"}</button>
+            <button class="auth-toggle" id="resendResetCode" type="button" ${busy}>${draft.action === "resending" ? "Resending code…" : "Send a new code"}</button>
+            <button class="auth-toggle" id="changeResetEmail" type="button" ${busy}>Change email</button>
+          </form>` : `
+          <form id="passwordResetEmailForm" class="auth-form" novalidate aria-busy="${state.authBusy}">
+            <label><span>Email address</span>
+              <input id="passwordResetEmail" class="auth-input" type="email" autocomplete="email" value="${escapeAttr(state.passwordResetEmail)}" ${errorAttributes("email")} ${busy} required>
+              ${fieldError("email")}
             </label>
-            ${state.authMessage ? `<p class="auth-message ${state.authMessageType === "success" ? "is-success" : ""}">${escapeText(state.authMessage)}</p>` : ""}
-            <button class="primary-btn" type="submit" ${state.authBusy ? "disabled" : ""}>${state.authBusy ? "Checking email" : "Send reset code"}</button>
-          </form>
-        `}
-        <button class="auth-toggle" id="backToSignIn" type="button" ${state.authBusy ? "disabled" : ""}>Back to Sign In</button>
+            <p class="auth-message ${state.authMessageType === "success" ? "is-success" : ""}" role="status" aria-live="polite" aria-atomic="true">${escapeText(state.authMessage)}</p>
+            <button class="primary-btn" type="submit" ${busy}>${draft.action === "sending" ? "Sending code…" : "Send reset code"}</button>
+          </form>`}
+        <button class="auth-toggle" id="backToSignIn" type="button" ${busy}>Back to sign in</button>
       </div>
-    </section>
-  `;
-
+    </section>`;
+  const fields = { passwordResetCode: "code", newPassword: "password", confirmNewPassword: "confirmation" };
+  for (const [id, field] of Object.entries(fields)) {
+    const input = app.querySelector(`#${id}`);
+    if (!input) continue;
+    input.value = draft[field];
+    input.addEventListener("input", () => { draft[field] = input.value; });
+  }
+  app.querySelector("#passwordResetEmail")?.addEventListener("input", (event) => {
+    state.passwordResetEmail = event.target.value;
+  });
   app.querySelector("#backToSignIn").addEventListener("click", returnToSignIn);
   app.querySelector("#passwordResetEmailForm")?.addEventListener("submit", handlePasswordResetEmail);
   app.querySelector("#passwordResetForm")?.addEventListener("submit", handlePasswordResetSubmit);
-  app.querySelector("#resendResetCode")?.addEventListener("click", () => {
-    requestPasswordResetCode(state.passwordResetEmail);
+  app.querySelector("#resendResetCode")?.addEventListener("click", () => requestPasswordResetCode(state.passwordResetEmail));
+  app.querySelector("#toggleResetPassword")?.addEventListener("click", (event) => {
+    draft.visible = !draft.visible;
+    for (const id of ["newPassword", "confirmNewPassword"]) app.querySelector(`#${id}`).type = draft.visible ? "text" : "password";
+    event.currentTarget.setAttribute("aria-pressed", String(draft.visible));
+    event.currentTarget.textContent = draft.visible ? "Hide passwords" : "Show passwords";
   });
+  app.querySelector("#changeResetEmail")?.addEventListener("click", () => {
+    clearInterval(passwordResetTimer);
+    state.passwordResetDraft = createPasswordResetDraft();
+    state.passwordResetDevelopmentCode = "";
+    state.authView = "forgot-email";
+    state.authMessage = "";
+    renderAuth();
+    app.querySelector("#passwordResetEmail")?.focus();
+  });
+  if (isPasswordStep) {
+    updatePasswordResetCountdown();
+    passwordResetTimer = setInterval(updatePasswordResetCountdown, 1000);
+  }
 }
+
+function updatePasswordResetCountdown() {
+  if (state.authView !== "forgot-password") { clearInterval(passwordResetTimer); return; }
+  const draft = state.passwordResetDraft;
+  const seconds = remainingResetSeconds(draft.retryAt);
+  const button = app.querySelector("#resendResetCode");
+  if (button) {
+    button.disabled = state.authBusy || seconds > 0;
+    button.textContent = draft.action === "resending" ? "Resending code…"
+      : seconds > 0 ? `Send a new code in ${seconds}s` : "Send a new code";
+  }
+  const expiry = app.querySelector("#resetExpiry");
+  if (expiry) expiry.textContent = draft.expiresAt && Date.now() >= draft.expiresAt
+    ? "Your code may have expired. Request a new code to continue."
+    : "Codes expire after 15 minutes. Use the most recent email.";
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && state.authView === "forgot-password") updatePasswordResetCountdown();
+});
 
 async function handlePasswordResetEmail(event) {
   event.preventDefault();
   if (state.authBusy) return;
   const email = app.querySelector("#passwordResetEmail").value.trim().toLowerCase();
+  state.passwordResetEmail = email;
+  state.passwordResetDraft.errors = {};
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    state.authMessage = "Enter a valid email address.";
+    state.passwordResetDraft.errors.email = "Enter a valid email address.";
     renderAuth();
+    app.querySelector("#passwordResetEmail").focus();
     return;
   }
-
-  requestPasswordResetCode(email);
+  await requestPasswordResetCode(email);
 }
 
 async function requestPasswordResetCode(email) {
-  if (state.authBusy) return;
+  const draft = state.passwordResetDraft;
+  if (state.authBusy || remainingResetSeconds(draft.retryAt) > 0) return;
   state.passwordResetEmail = email;
+  const resending = state.authView === "forgot-password";
+  draft.action = resending ? "resending" : "sending";
+  draft.errors = {};
   state.authBusy = true;
   state.authMessage = "";
   state.authMessageType = "error";
-  state.passwordResetDevelopmentCode = "";
   renderAuth();
   try {
-    const result = await authRequest("/api/auth/password-reset/request", {
-      method: "POST",
-      body: { email },
-    });
-    state.authBusy = false;
+    const result = await authRequest("/api/auth/password-reset/request", { method: "POST", body: { email }, timeoutMs: 15000 });
     state.authView = "forgot-password";
     state.passwordResetDevelopmentCode = result.developmentCode || "";
-    state.authMessage = "If an account exists for that email, a six-digit code is on its way. Check your spam folder too.";
+    draft.code = "";
+    draft.retryAt = Date.now() + (result.retryAfterSeconds || 60) * 1000;
+    draft.expiresAt = Date.now() + (result.expiresInSeconds || 900) * 1000;
+    state.authMessage = "If an account exists for that email, a code is on its way.";
     state.authMessageType = "success";
-    renderAuth();
   } catch (error) {
+    if (error.status === 429) draft.retryAt = Date.now() + (error.retryAfterSeconds || 60) * 1000;
+    state.authMessage = error.status === 404 ? "Password recovery is currently unavailable. Please try again later."
+      : error.message || "Unable to send a reset code. Please try again.";
+  } finally {
     state.authBusy = false;
-    state.authMessage = error.status === 404 && error.message === "Not found."
-      ? "Password recovery is not available on the current app service yet. Please contact support."
-      : error.message || "Unable to start password reset.";
-    state.authMessageType = "error";
+    draft.action = "";
     renderAuth();
+    if (state.authMessageType === "success") app.querySelector("#passwordResetCode")?.focus();
   }
 }
 
 async function handlePasswordResetSubmit(event) {
   event.preventDefault();
   if (state.authBusy) return;
-  const code = app.querySelector("#passwordResetCode").value.trim();
-  const newPassword = app.querySelector("#newPassword").value;
-  const confirmPassword = app.querySelector("#confirmNewPassword").value;
-
-  if (!/^\d{6}$/.test(code)) {
-    state.authMessage = "Enter the six-digit reset code.";
-    state.authMessageType = "error";
-    renderAuth();
-    return;
-  }
-  if (newPassword.length < 6) {
-    state.authMessage = "Password must be at least 6 characters.";
-    state.authMessageType = "error";
-    renderAuth();
-    return;
-  }
-  if (newPassword !== confirmPassword) {
-    state.authMessage = "Passwords do not match.";
-    state.authMessageType = "error";
-    renderAuth();
-    return;
-  }
-
-  state.authBusy = true;
+  const draft = state.passwordResetDraft;
+  draft.code = app.querySelector("#passwordResetCode").value.trim();
+  draft.password = app.querySelector("#newPassword").value;
+  draft.confirmation = app.querySelector("#confirmNewPassword").value;
+  draft.errors = validatePasswordReset(draft);
   state.authMessage = "";
   state.authMessageType = "error";
+  if (Object.keys(draft.errors).length) {
+    renderAuth();
+    app.querySelector('[aria-invalid="true"]')?.focus();
+    return;
+  }
+  draft.action = "updating";
+  state.authBusy = true;
   renderAuth();
   try {
     await authRequest("/api/auth/password-reset", {
-      method: "POST",
-      body: {
-        email: state.passwordResetEmail,
-        code,
-        newPassword,
-      },
+      method: "POST", timeoutMs: 15000,
+      body: { email: state.passwordResetEmail, code: draft.code, newPassword: draft.password },
     });
     const email = state.passwordResetEmail;
     returnToSignIn();
     state.authEmail = email;
-    state.authMessage = "Password updated successfully. Please sign in with your new password.";
+    state.authMessage = "Password updated. Sign in with your new password.";
     state.authMessageType = "success";
     renderAuth();
   } catch (error) {
     state.authBusy = false;
-    state.authMessage = error.message || "Unable to update password.";
-    state.authMessageType = "error";
+    draft.action = "";
+    if (error.code === "INVALID_RESET_CODE") draft.errors.code = error.message;
+    state.authMessage = error.message || "Unable to update password. Please try again.";
     renderAuth();
+    app.querySelector('[aria-invalid="true"]')?.focus();
   }
 }
 
 function returnToSignIn() {
+  clearInterval(passwordResetTimer);
+  state.passwordResetDraft = createPasswordResetDraft();
   state.authView = "signin";
   state.authMode = "signin";
   state.authBusy = false;
@@ -2760,25 +2806,30 @@ async function authRequest(path, options = {}) {
   if (token) headers.Authorization = `Bearer ${token}`;
 
   let response;
+  let data = {};
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), options.timeoutMs || 15000);
   try {
     response = await fetch(`${AUTH_API_BASE}${path}`, {
       method: options.method || "GET",
+      signal: controller.signal,
       headers,
       body: options.body ? JSON.stringify(options.body) : undefined,
     });
+    try { data = await response.json(); }
+    catch (error) { if (controller.signal.aborted) throw error; }
   } catch {
-    throw new Error("The Keyman service is temporarily unavailable. Check your connection and try again.");
-  }
-  let data = {};
-  try {
-    data = await response.json();
-  } catch {
-    data = {};
+    throw new Error(controller.signal.aborted
+      ? "The request took too long. Please try again. If you requested a code, check your email first."
+      : "The Keyman service is temporarily unavailable. Check your connection and try again.");
+  } finally {
+    clearTimeout(timer);
   }
   if (!response.ok) {
     const error = new Error(data.error || "Authentication request failed.");
     error.status = response.status;
     error.code = data.code || "";
+    error.retryAfterSeconds = data.retryAfterSeconds;
     throw error;
   }
   return data;

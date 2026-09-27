@@ -70,3 +70,29 @@ strings, bodies, authorization headers, and raw database error details.
 
 These safeguards improve recovery and diagnosis; they do not establish the cause
 of the September 2026 timeouts. Deploy the updated backend to activate them.
+
+## Password recovery rollout (September 2026)
+
+The reset UI preserves fields on errors, uses a wall-clock resend countdown, and
+keeps passwords only in memory. Requests time out after 15 seconds. The existing
+reset endpoints remain compatible; request receipts now include
+`retryAfterSeconds: 60` and `expiresInSeconds: 900`. Requests during the cooldown
+return the same HTTP 200 receipt without sending another email, matching unknown
+accounts and avoiding an account-existence signal. Older clients remain usable.
+
+Reset issuance, attempt counting, and code consumption use a short transaction
+locking the user's row. Email delivery runs outside the lock, and failed delivery
+removes only its own code. Successful reset revokes all existing sessions.
+
+Production activation requires a verified sending domain in Resend and these
+Render values: `RESEND_API_KEY`, `PASSWORD_RESET_FROM_EMAIL`, and the existing
+`PASSWORD_RESET_SECRET`. Preserve the existing secret. The requested sender domain
+is `keymanassistant.com`, registered and verified in Resend. Render has a
+domain-scoped sending key and `Keyman Assistant <no-reply@keymanassistant.com>`
+configured as the sender. Confirm real delivery after deploying these changes.
+
+Run `npm test` for local and UI regressions. To include real PostgreSQL concurrency
+checks, point `KEYMAN_TEST_DATABASE_URL` at an isolated disposable test database;
+never use a production database. The tests create test accounts in that database.
+Run `npm run build` to refresh bundled mobile assets. A new mobile release is
+required for installed apps to receive the improved screens.

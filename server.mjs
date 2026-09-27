@@ -226,10 +226,40 @@ async function insertUser(user) {
   saveDb(db);
 }
 
-async function getPasswordReset(userId) {
+const localResetLocks = new Map();
+async function withPasswordResetLock(userId, action) {
   if (pool) {
     await ensurePostgres();
-    const result = await pool.query(
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const user = await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
+      const result = user.rows.length ? await action(client) : null;
+      await client.query("COMMIT");
+      return result;
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  const previous = localResetLocks.get(userId) || Promise.resolve();
+  const pending = previous.catch(() => {}).then(() => action(null));
+  localResetLocks.set(userId, pending);
+  try { return await pending; }
+  finally { if (localResetLocks.get(userId) === pending) localResetLocks.delete(userId); }
+}
+
+function passwordResetConfigured() {
+  return Boolean(PASSWORD_RESET_SECRET && (process.env.NODE_ENV !== "production"
+    || (RESEND_API_KEY && PASSWORD_RESET_FROM_EMAIL)));
+}
+
+async function getPasswordReset(userId, client = pool) {
+  if (pool) {
+    await ensurePostgres();
+    const result = await client.query(
       "SELECT token_hash, expires_at, attempts, requested_at FROM password_reset_tokens WHERE user_id = $1",
       [userId],
     );
@@ -246,10 +276,10 @@ async function getPasswordReset(userId) {
   return db.passwordResets?.[userId] || null;
 }
 
-async function savePasswordReset(userId, reset) {
+async function savePasswordReset(userId, reset, client = pool) {
   if (pool) {
     await ensurePostgres();
-    await pool.query(
+    await client.query(
       `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, attempts, requested_at)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (user_id) DO UPDATE SET
@@ -267,10 +297,10 @@ async function savePasswordReset(userId, reset) {
   saveDb(db);
 }
 
-async function incrementPasswordResetAttempts(userId) {
+async function incrementPasswordResetAttempts(userId, client = pool) {
   if (pool) {
     await ensurePostgres();
-    await pool.query(
+    await client.query(
       "UPDATE password_reset_tokens SET attempts = attempts + 1 WHERE user_id = $1",
       [userId],
     );
@@ -283,10 +313,10 @@ async function incrementPasswordResetAttempts(userId) {
   }
 }
 
-async function deletePasswordReset(userId) {
+async function deletePasswordReset(userId, client = pool) {
   if (pool) {
     await ensurePostgres();
-    await pool.query("DELETE FROM password_reset_tokens WHERE user_id = $1", [userId]);
+    await client.query("DELETE FROM password_reset_tokens WHERE user_id = $1", [userId]);
     return;
   }
   const db = loadDb();
@@ -294,25 +324,15 @@ async function deletePasswordReset(userId) {
   saveDb(db);
 }
 
-async function completePasswordReset(userId, passwordRecord) {
+async function completePasswordReset(userId, passwordRecord, client = pool) {
   if (pool) {
     await ensurePostgres();
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      await client.query(
-        "UPDATE users SET salt = $1, password_hash = $2 WHERE id = $3",
-        [passwordRecord.salt, passwordRecord.passwordHash, userId],
-      );
-      await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
-      await client.query("DELETE FROM password_reset_tokens WHERE user_id = $1", [userId]);
-      await client.query("COMMIT");
-    } catch (error) {
-      await client.query("ROLLBACK");
-      throw error;
-    } finally {
-      client.release();
-    }
+    await client.query(
+      "UPDATE users SET salt = $1, password_hash = $2 WHERE id = $3",
+      [passwordRecord.salt, passwordRecord.passwordHash, userId],
+    );
+    await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+    await client.query("DELETE FROM password_reset_tokens WHERE user_id = $1", [userId]);
     return;
   }
 
@@ -551,43 +571,41 @@ async function handlePasswordResetRequest(request, response) {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return sendJson(response, 400, { error: "Enter a valid email address." });
   }
-
-  const user = await findUserByEmail(email);
-  // Always return the same result for unknown addresses so this endpoint
-  // cannot be used to discover which people have Keyman accounts.
-  if (!user) return sendJson(response, 200, {
-    ok: true,
-    expiresInSeconds: PASSWORD_RESET_TTL_MS / 1000,
-  });
-  if (!PASSWORD_RESET_SECRET) {
-    return sendJson(response, 503, { error: "Password reset is not configured." });
-  }
-
-  const now = Date.now();
-  const existingReset = await getPasswordReset(user.id);
-  if (existingReset && now - existingReset.requestedAt < PASSWORD_RESET_COOLDOWN_MS) {
-    return sendJson(response, 429, { error: "Please wait before requesting another reset code." });
-  }
-
-  const code = createResetCode();
-  const reset = {
-    tokenHash: hashResetCode(code, PASSWORD_RESET_SECRET),
-    expiresAt: now + PASSWORD_RESET_TTL_MS,
-    attempts: 0,
-    requestedAt: now,
-  };
-  await savePasswordReset(user.id, reset);
-
-  try {
-    const delivered = await sendPasswordResetEmail(email, code, user.id, now);
-    return sendJson(response, 200, {
-      ok: true,
-      expiresInSeconds: PASSWORD_RESET_TTL_MS / 1000,
-      developmentCode: delivered ? undefined : code,
+  // Check service configuration before account lookup to avoid disclosing account existence.
+  if (!passwordResetConfigured()) {
+    return sendJson(response, 503, {
+      error: "Password reset email is temporarily unavailable. Please try again later.",
+      code: "PASSWORD_RESET_UNAVAILABLE",
     });
-  } catch (error) {
-    await deletePasswordReset(user.id);
-    console.error("Password reset email delivery failed:", error.message || error);
+  }
+  const receipt = { ok: true, expiresInSeconds: PASSWORD_RESET_TTL_MS / 1000,
+    retryAfterSeconds: PASSWORD_RESET_COOLDOWN_MS / 1000 };
+  const user = await findUserByEmail(email);
+  if (!user) return sendJson(response, 200, receipt);
+  const code = createResetCode();
+  const reset = await withPasswordResetLock(user.id, async (client) => {
+    const now = Date.now();
+    const existing = await getPasswordReset(user.id, client);
+    if (existing && now - existing.requestedAt < PASSWORD_RESET_COOLDOWN_MS) return null;
+    const next = { tokenHash: hashResetCode(code, PASSWORD_RESET_SECRET),
+      expiresAt: now + PASSWORD_RESET_TTL_MS, attempts: 0, requestedAt: now };
+    await savePasswordReset(user.id, next, client);
+    return next;
+  });
+  // Return the same receipt during cooldown; do not reveal which addresses have accounts.
+  if (!reset) return sendJson(response, 200, receipt);
+  try {
+    // Email delivery is outside the transaction: no database lock is held across network I/O.
+    const delivered = await sendPasswordResetEmail(email, code, user.id, reset.requestedAt);
+    return sendJson(response, 200, { ...receipt, developmentCode: delivered ? undefined : code });
+  } catch {
+    await withPasswordResetLock(user.id, async (client) => {
+      const current = await getPasswordReset(user.id, client);
+      if (current?.tokenHash === reset.tokenHash && current.requestedAt === reset.requestedAt) {
+        await deletePasswordReset(user.id, client);
+      }
+    });
+    console.error(JSON.stringify({ event: "password_reset_delivery_failed" }));
     return sendJson(response, 503, {
       error: "Password reset email is temporarily unavailable. Please try again later.",
       code: "PASSWORD_RESET_DELIVERY_FAILED",
@@ -602,30 +620,29 @@ async function handlePasswordReset(request, response) {
   const newPassword = String(body.newPassword || "");
   const error = validateCredentials(email, newPassword);
   if (error) return sendJson(response, 400, { error });
-  if (!/^\d{6}$/.test(code)) {
-    return sendJson(response, 400, { error: "Enter the six-digit reset code." });
-  }
-  if (!PASSWORD_RESET_SECRET) {
-    return sendJson(response, 503, { error: "Password reset is not configured." });
-  }
-
+  if (!/^\d{6}$/.test(code)) return sendJson(response, 400, { error: "Enter the six-digit reset code." });
+  if (!passwordResetConfigured()) return sendJson(response, 503, {
+    error: "Password reset email is temporarily unavailable. Please try again later.",
+    code: "PASSWORD_RESET_UNAVAILABLE",
+  });
   const user = await findUserByEmail(email);
-  if (!user) return sendJson(response, 404, { error: "No account found with that email." });
-  const reset = await getPasswordReset(user.id);
-  const invalidOrExpired = !reset
-    || reset.expiresAt <= Date.now()
-    || reset.attempts >= PASSWORD_RESET_MAX_ATTEMPTS;
-  if (invalidOrExpired) {
-    if (reset) await deletePasswordReset(user.id);
-    return sendJson(response, 400, { error: "Reset code is invalid or expired." });
-  }
-
-  if (!resetCodeMatches(code, reset.tokenHash, PASSWORD_RESET_SECRET)) {
-    await incrementPasswordResetAttempts(user.id);
-    return sendJson(response, 400, { error: "Reset code is invalid or expired." });
-  }
-
-  await completePasswordReset(user.id, createPasswordRecord(newPassword));
+  const valid = user && await withPasswordResetLock(user.id, async (client) => {
+    const reset = await getPasswordReset(user.id, client);
+    if (!reset || reset.expiresAt <= Date.now() || reset.attempts >= PASSWORD_RESET_MAX_ATTEMPTS) {
+      if (reset) await deletePasswordReset(user.id, client);
+      return false;
+    }
+    if (!resetCodeMatches(code, reset.tokenHash, PASSWORD_RESET_SECRET)) {
+      await incrementPasswordResetAttempts(user.id, client);
+      return false;
+    }
+    await completePasswordReset(user.id, createPasswordRecord(newPassword), client);
+    return true;
+  });
+  if (!valid) return sendJson(response, 400, {
+    error: "Reset code is invalid or expired. Check the code or request a new one.",
+    code: "INVALID_RESET_CODE",
+  });
   return sendJson(response, 200, { ok: true });
 }
 
@@ -705,10 +722,7 @@ async function handleHealth(response) {
     ok: true,
     storage: pool ? "postgres" : "json",
     features: {
-      passwordReset: Boolean(
-        PASSWORD_RESET_SECRET
-          && (process.env.NODE_ENV !== "production" || (RESEND_API_KEY && PASSWORD_RESET_FROM_EMAIL)),
-      ),
+      passwordReset: passwordResetConfigured(),
       sessionIdleTimeoutDays: SESSION_IDLE_TTL_MS / (24 * 60 * 60 * 1000),
     },
   });
