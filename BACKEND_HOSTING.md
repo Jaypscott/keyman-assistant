@@ -52,3 +52,21 @@ window.KEYMAN_CONFIG = {
 ```
 
 Then run `npm run native:sync` and rebuild the iOS app.
+
+## Failure handling and diagnostics
+
+Database connections and pool checkout wait at most 1 second. PostgreSQL statements
+have a 2-second server-side limit and queries have a 3-second client-side limit.
+The health endpoint checks current database connectivity and returns HTTP 503 on
+failure, with a 4-second overall deadline (before Render's 5-second timeout).
+Failed schema initialization is retried on a later request.
+
+Idle pool errors are handled without terminating the server. Unexpected request
+failures return a generic HTTP 500; malformed JSON returns HTTP 400. Structured
+logs identify `database_pool_error`, `database_health_error`, and `request_error`.
+Requests lasting at least 1 second emit `slow_request_pending` and, when closed,
+`slow_request_completed`, including a known route and duration. Logs omit query
+strings, bodies, authorization headers, and raw database error details.
+
+These safeguards improve recovery and diagnosis; they do not establish the cause
+of the September 2026 timeouts. Deploy the updated backend to activate them.

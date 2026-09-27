@@ -36,9 +36,20 @@ const PASSWORD_RESET_SECRET = process.env.PASSWORD_RESET_SECRET
 const { Pool } = pg;
 const pool = DATABASE_URL ? new Pool({
   connectionString: DATABASE_URL,
+  connectionTimeoutMillis: 1000,
+  statement_timeout: 2000,
+  query_timeout: 3000,
   ssl: process.env.PGSSLMODE === "require" ? { rejectUnauthorized: false } : undefined,
 }) : null;
+// Never log the client or raw database errors: they can contain credentials or SQL data.
+pool?.on("error", (error) => {
+  console.error(JSON.stringify({ event: "database_pool_error", code: safeErrorCode(error) }));
+});
 let postgresReady;
+
+function safeErrorCode(error) {
+  return /^[A-Z0-9_]{2,40}$/.test(error?.code || "") ? error.code : "UNKNOWN";
+}
 
 const defaultDb = { users: [], sessions: [], appData: {}, passwordResets: {} };
 
@@ -183,7 +194,11 @@ async function ensurePostgres() {
         )
     `);
     await pool.query("UPDATE app_data SET topic = '' WHERE BTRIM(topic) <> ''");
-  })();
+  })().catch((error) => {
+    // A transient initialization failure must not poison every later request.
+    postgresReady = undefined;
+    throw error;
+  });
   return postgresReady;
 }
 
@@ -667,7 +682,25 @@ async function handleSaveAppData(request, response) {
 }
 
 async function handleHealth(response) {
-  if (pool) await ensurePostgres();
+  if (pool) {
+    let timer;
+    try {
+      await Promise.race([
+        (async () => {
+          await ensurePostgres();
+          await pool.query("SELECT 1");
+        })(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("Health check timed out.")), 4000);
+        }),
+      ]);
+    } catch (error) {
+      console.error(JSON.stringify({ event: "database_health_error", code: safeErrorCode(error) }));
+      return sendJson(response, 503, { ok: false, error: "Database temporarily unavailable." });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
   return sendJson(response, 200, {
     ok: true,
     storage: pool ? "postgres" : "json",
@@ -698,23 +731,48 @@ function handlePrivacy(response) {
 }
 
 export const server = createServer(async (request, response) => {
+  const startedAt = performance.now();
+  // Restrict log paths to known routes; omit query strings, bodies, and headers.
+  const path = request.url?.split("?")[0];
+  const route = ["/api/health", "/api/weather", "/privacy", "/privacy.html",
+    "/api/auth/register", "/api/auth/login", "/api/auth/password-reset/request",
+    "/api/auth/password-reset", "/api/auth/me", "/api/auth/logout", "/api/app-data",
+  ].includes(path) ? path : "unmatched";
+  const logSlowRequest = (event) => console.warn(JSON.stringify({
+    event, route, durationMs: Math.round(performance.now() - startedAt),
+    status: response.writableFinished ? response.statusCode : undefined,
+  }));
+  const slowTimer = setTimeout(() => logSlowRequest("slow_request_pending"), 1000);
+  slowTimer.unref();
+  response.once("close", () => {
+    clearTimeout(slowTimer);
+    if (performance.now() - startedAt >= 1000) logSlowRequest("slow_request_completed");
+  });
   try {
     if (request.method === "OPTIONS") return sendJson(response, 204, {});
-    if (request.url === "/api/health") return handleHealth(response);
-    if (request.url?.startsWith("/api/weather?") && request.method === "GET") return handleWeather(request, response);
-    if ((request.url === "/privacy" || request.url === "/privacy.html") && request.method === "GET") return handlePrivacy(response);
-    if (request.url === "/api/auth/register" && request.method === "POST") return handleRegister(request, response);
-    if (request.url === "/api/auth/login" && request.method === "POST") return handleLogin(request, response);
-    if (request.url === "/api/auth/password-reset/request" && request.method === "POST") return handlePasswordResetRequest(request, response);
-    if (request.url === "/api/auth/password-reset" && request.method === "POST") return handlePasswordReset(request, response);
-    if (request.url === "/api/auth/me" && request.method === "GET") return handleMe(request, response);
-    if (request.url === "/api/auth/me" && request.method === "DELETE") return handleDeleteMe(request, response);
-    if (request.url === "/api/auth/logout" && request.method === "POST") return handleLogout(request, response);
-    if (request.url === "/api/app-data" && request.method === "GET") return handleGetAppData(request, response);
-    if (request.url === "/api/app-data" && request.method === "PUT") return handleSaveAppData(request, response);
+    if (request.url === "/api/health") return await handleHealth(response);
+    if (request.url?.startsWith("/api/weather?") && request.method === "GET") return await handleWeather(request, response);
+    if ((request.url === "/privacy" || request.url === "/privacy.html") && request.method === "GET") return await handlePrivacy(response);
+    if (request.url === "/api/auth/register" && request.method === "POST") return await handleRegister(request, response);
+    if (request.url === "/api/auth/login" && request.method === "POST") return await handleLogin(request, response);
+    if (request.url === "/api/auth/password-reset/request" && request.method === "POST") return await handlePasswordResetRequest(request, response);
+    if (request.url === "/api/auth/password-reset" && request.method === "POST") return await handlePasswordReset(request, response);
+    if (request.url === "/api/auth/me" && request.method === "GET") return await handleMe(request, response);
+    if (request.url === "/api/auth/me" && request.method === "DELETE") return await handleDeleteMe(request, response);
+    if (request.url === "/api/auth/logout" && request.method === "POST") return await handleLogout(request, response);
+    if (request.url === "/api/app-data" && request.method === "GET") return await handleGetAppData(request, response);
+    if (request.url === "/api/app-data" && request.method === "PUT") return await handleSaveAppData(request, response);
     return sendJson(response, 404, { error: "Not found." });
   } catch (error) {
-    return sendJson(response, 400, { error: error.message || "Request failed." });
+    const invalidBody = ["Invalid JSON.", "Request body is too large."].includes(error.message);
+    if (!invalidBody) {
+      console.error(JSON.stringify({ event: "request_error", route, code: safeErrorCode(error) }));
+    }
+    if (!response.destroyed && !response.writableEnded) {
+      return sendJson(response, invalidBody ? 400 : 500, {
+        error: invalidBody ? error.message : "Request failed. Please try again.",
+      });
+    }
   }
 });
 
