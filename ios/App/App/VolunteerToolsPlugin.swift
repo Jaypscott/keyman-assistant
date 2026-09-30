@@ -374,5 +374,11 @@ private extension UIImage.Orientation {
 class BridgeViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(VolunteerToolsPlugin())
+        // Dynamic native color covers the gap before the first themed web paint.
+        let surface = UIColor(named: "LaunchBackground") ?? .systemBackground
+        webView?.isOpaque = false
+        webView?.backgroundColor = surface
+        webView?.scrollView.backgroundColor = surface
+        view.backgroundColor = surface
     }
 }

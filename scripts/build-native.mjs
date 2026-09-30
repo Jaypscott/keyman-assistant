@@ -1,6 +1,8 @@
 import { cp, mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 
+const preserveExisting = process.argv.includes("--preserve-existing");
+
 const root = new URL("..", import.meta.url).pathname;
 const output = join(root, "www");
 const iosOutput = join(root, "ios", "App", "App", "public");
@@ -22,7 +24,7 @@ const directories = [
   "types",
 ];
 
-await rm(output, { recursive: true, force: true });
+if (!preserveExisting) await rm(output, { recursive: true, force: true });
 await mkdir(output, { recursive: true });
 
 for (const file of files) {
@@ -36,7 +38,7 @@ for (const directory of directories) {
 await cp(join(root, "assets"), join(output, "assets"), { recursive: true });
 await cp(join(root, "public"), join(output, "public"), { recursive: true });
 
-await rm(iosOutput, { recursive: true, force: true });
+if (!preserveExisting) await rm(iosOutput, { recursive: true, force: true });
 await cp(output, iosOutput, { recursive: true });
 await cp(
   join(root, "capacitor.config.json"),

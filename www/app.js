@@ -1,3 +1,9 @@
+import { rosterReviewMarkup } from './components/RosterReview.mjs';
+import { scanRosterImage } from './services/volunteers/rosterImport.mjs';
+import { createChiefChat } from "./services/chief/chiefChat.mjs";
+import { chiefSparkle } from "./components/ChiefChat.mjs";
+import { chiefDraftState, validateChiefSchedule } from "./services/chief/chiefDraft.mjs";
+import { watchSystemAppearance } from "./services/appearance/systemAppearance.mjs";
 import { createPasswordResetDraft, remainingResetSeconds, validatePasswordReset } from "./services/auth/passwordResetState.mjs";
 import { renderWeatherCard, renderWeatherPullIndicator } from "./components/WeatherCard.mjs";
 import { renderLocationHomePage, renderLocationPageIndicator } from "./components/LocationHomePage.mjs";
@@ -116,6 +122,57 @@ const state = {
 const app = document.querySelector("#app");
 const nav = document.querySelector(".bottom-nav");
 const shell = document.querySelector(".phone-shell");
+const chiefLaunch = document.createElement("button");
+chiefLaunch.type = "button";
+chiefLaunch.className = "chief-launch";
+chiefLaunch.setAttribute("aria-label", "Talk to Chief");
+chiefLaunch.innerHTML = chiefSparkle;
+chiefLaunch.hidden = true;
+shell.append(chiefLaunch);
+let chiefReviewSnapshot = null;
+const chiefNavigationKeys = ["tab", "homeView", "selectedLocation", "selectedShift", "selectedDate", "selectedRotationDuration", "primaryOnly", "rotationOrigin", "rotationView", "scheduleEditing", "volunteerContacts", "schedule", "message"];
+const chiefChat = createChiefChat({
+  host: shell, request: authRequest, getContext: getChiefContext, getRosterPlugin: getVolunteerToolsPlugin,
+  onVisibility(open) {
+    shell.dataset.chief = open ? "open" : "closed";
+    app.inert = open; nav.inert = open; chiefLaunch.inert = open;
+    for (const element of [app, nav, chiefLaunch]) {
+      if (open) element.setAttribute("aria-hidden", "true"); else element.removeAttribute("aria-hidden");
+    }
+    updateShellSurface();
+  },
+  onReview(draft) {
+    try {
+      const review = chiefDraftState(draft, state.volunteerContacts);
+      chiefReviewSnapshot = Object.fromEntries(chiefNavigationKeys.map(key => [key, structuredClone(state[key])]));
+      Object.assign(state, review);
+      updateNav(); render(); window.scrollTo(0, 0);
+    } catch (error) { showToast(error.message); chiefChat.open(); }
+  },
+});
+chiefLaunch.addEventListener("click", () => chiefChat.open());
+function getChiefContext() {
+  const location = state.selectedLocation || locationPages[state.activeLocationIndex];
+  return { locationId: location?.id, date: state.tab === "calendar" ? state.calendarDate : state.selectedDate,
+    shiftId: state.selectedShift?.id, names: cleanVolunteerContacts(state.volunteerContacts).map(c => c.name),
+    duration: state.selectedShift ? state.selectedRotationDuration : undefined,
+    primaryOnly: state.selectedShift ? state.primaryOnly : undefined,
+    activeDraft: state.schedule ? { rows: state.schedule } : undefined };
+}
+function updateChiefEntry() {
+  const visible = state.authenticated && !state.selectedShift
+    && (state.tab !== "home" || state.homeView === "shifts")
+    && (state.tab !== "profile" || state.profileView === "settings")
+    && (state.tab !== "calendar" || (!state.calendarEventId && !state.calendarCreateOpen));
+  chiefLaunch.hidden = !visible;
+  shell.dataset.chiefEntry = visible ? "visible" : "hidden";
+}
+new MutationObserver(updateChiefEntry).observe(app, { childList: true });
+function returnFromChiefReview() {
+  if (chiefReviewSnapshot) Object.assign(state, chiefReviewSnapshot);
+  chiefReviewSnapshot = null;
+  updateNav(); render(); chiefChat.open();
+}
 const weatherByLocation = new Map(locationPages.map((location) => [
   location.id,
   createWeatherController({ location: location.weatherLocation }),
@@ -171,6 +228,7 @@ nav.addEventListener("click", (event) => {
 });
 
 function render() {
+  updateChiefEntry();
   updateShellSurface();
   if (!state.authenticated) {
     renderAuth();
@@ -206,12 +264,17 @@ function updateShellSurface() {
     && state.tab === "home"
     && state.homeView === "notes";
   const isWhitePage = state.authenticated && (state.tab === "calendar" || isNotesPage);
-  const surface = !state.authenticated ? "auth" : isRotationFlow ? "rotation" : isMintPage ? "mint" : isWhitePage ? "white" : "paper";
-  const color = surface === "auth" || surface === "rotation" || surface === "white" ? "#ffffff" : surface === "mint" ? "#dff3ec" : "#f6faf8";
+  const surface = shell.dataset.chief === "open" ? "white" : !state.authenticated ? "auth" : isRotationFlow ? "rotation" : isMintPage ? "mint" : isWhitePage ? "white" : "paper";
+  const surfaceToken = surface === "auth" || surface === "rotation" || surface === "white" ? "--panel" : surface === "mint" ? "--mint" : "--paper";
+  const color = getComputedStyle(document.documentElement).getPropertyValue(surfaceToken).trim();
   shell.dataset.surface = surface;
   shell.dataset.rotationFlow = isRotationFlow ? "active" : "inactive";
   shell.dataset.notesEditor = isNotesEditor ? "active" : "inactive";
   document.documentElement.style.setProperty("--native-status-surface", color);
+  document.querySelectorAll('meta[name="theme-color"]').forEach((meta) => {
+    // Only update the active media-qualified tag; the other remains a startup fallback.
+    meta.content = color;
+  });
   updateNativeStatusBar(color);
 }
 
@@ -517,6 +580,10 @@ function getInitialTab() {
 }
 
 function renderProfile() {
+  if (state.profileView === "appearance") {
+    renderAppearance();
+    return;
+  }
   if (state.profileView === "privacy") {
     renderPrivacyPolicy();
     return;
@@ -539,6 +606,14 @@ function renderProfile() {
         </div>
       </article>
 
+      <section class="profile-card profile-settings" aria-labelledby="settings-title">
+        <h2 id="settings-title">Settings</h2>
+        <button class="settings-link" id="openAppearance" type="button">
+          <span>Appearance</span><span class="settings-current">${({ light: 'Light', dark: 'Dark' })[document.documentElement.dataset.appearance] || 'System'}</span>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>
+        </button>
+      </section>
+
       ${state.profileMessage ? `<p class="message">${escapeText(state.profileMessage)}</p>` : ""}
 
       <div class="profile-actions">
@@ -549,6 +624,11 @@ function renderProfile() {
     </section>
   `;
 
+  app.querySelector('#openAppearance').addEventListener('click', () => {
+    state.profileView = 'appearance';
+    renderProfile();
+    app.querySelector('#appearance-title').focus();
+  });
   app.querySelector("#privacyPolicy").addEventListener("click", () => {
     if (PRIVACY_POLICY_URL) {
       window.open(PRIVACY_POLICY_URL, "_blank", "noopener");
@@ -559,6 +639,43 @@ function renderProfile() {
   });
   app.querySelector("#signOut").addEventListener("click", signOut);
   app.querySelector("#deleteAccount").addEventListener("click", deleteAccount);
+}
+
+function renderAppearance() {
+  app.className = 'app profile-screen appearance-screen';
+  const selected = document.documentElement.dataset.appearance || 'system';
+  app.innerHTML = `
+    <section class="screen">
+      <div class="topbar">
+        <button class="icon-btn" id="backToProfile" aria-label="Back to profile"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg></button>
+        <h1 id="appearance-title" tabindex="-1">Appearance</h1>
+      </div>
+      <fieldset class="appearance-options">
+        <legend class="sr-only">Display preference</legend>
+        <div class="appearance-choices">
+          ${[['light', 'Light'], ['dark', 'Dark'], ['system', 'System']].map(([value, label]) => `
+            <label class="appearance-choice">
+              <input type="radio" name="appearance" value="${value}" aria-label="${label}" ${value === 'system' ? 'aria-describedby="system-appearance-hint"' : ''} ${selected === value ? 'checked' : ''}>
+              <span class="appearance-option"><span class="appearance-label">${label}${value === 'system' ? '<small id="system-appearance-hint">Use your device’s appearance</small>' : ''}</span><span class="appearance-check" aria-hidden="true">✓</span></span>
+            </label>`).join('')}
+        </div>
+      </fieldset>
+    </section>`;
+  app.querySelector('#backToProfile').addEventListener('click', () => {
+    state.profileView = 'settings';
+    renderProfile();
+    app.querySelector('#openAppearance').focus();
+  });
+  app.querySelectorAll('input[name="appearance"]').forEach(input => {
+    input.addEventListener('change', () => {
+      if (!input.checked) return;
+      const value = input.value;
+      if (value === 'system') delete document.documentElement.dataset.appearance;
+      else document.documentElement.dataset.appearance = value;
+      try { localStorage.setItem('keyman-appearance', value); } catch {}
+      updateShellSurface();
+    });
+  });
 }
 
 function renderPrivacyPolicy() {
@@ -1351,7 +1468,7 @@ function renderScheduleReview() {
   app.innerHTML = `
     <section class="screen rotation-screen">
       <header class="rotation-flow-header review-header">
-        <button class="icon-btn" id="backToSetup" type="button" aria-label="Back to rotation setup">
+        <button class="icon-btn" id="backToSetup" type="button" aria-label="${state.rotationOrigin === "chief" ? "Back to Chief" : "Back to rotation setup"}">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
         </button>
         <div class="rotation-flow-heading">
@@ -1408,6 +1525,7 @@ function renderScheduleReview() {
   `;
 
   app.querySelector("#backToSetup").addEventListener("click", () => {
+    if (state.rotationOrigin === "chief") return returnFromChiefReview();
     state.rotationView = "setup";
     state.scheduleEditing = false;
     state.message = "";
@@ -1443,6 +1561,12 @@ async function saveCurrentScheduleToCalendar() {
   const shift = state.selectedShift;
   const location = state.selectedLocation || locationPages[0];
   const contacts = cleanVolunteerContacts(state.volunteerContacts);
+  if (state.rotationOrigin === "chief") {
+    try { validateChiefSchedule(state.schedule, contacts.map(c => c.name), shift, state.selectedRotationDuration, state.primaryOnly); }
+    catch (error) { showToast(error.message); return; }
+  }
+  const existing = state.events.find(item => item.date === state.selectedDate && item.shiftId === shift.id && (item.locationId || locationPages[0].id) === location.id);
+  if (existing && !confirm(`Replace the saved rotation at ${location.title} on ${state.selectedDate} (${shift.label})?`)) return;
   const event = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()),
     date: state.selectedDate,
@@ -1458,9 +1582,21 @@ async function saveCurrentScheduleToCalendar() {
     volunteerContacts: contacts,
     schedule: state.schedule,
   };
+  const previousEvents = state.events;
+  const previousChecks = structuredClone(state.checks);
   state.events = [event, ...state.events.filter((item) => !(item.date === event.date && item.shiftId === event.shiftId && (item.locationId || locationPages[0].id) === event.locationId))];
   state.checks[event.id] = state.checks[event.id] || Array.from({ length: tasks.length }, () => false);
-  await persistAppData({ immediate: true });
+  const saveButton = app.querySelector("#saveEvent");
+  if (saveButton) saveButton.disabled = true;
+  try { await persistAppData({ immediate: true, propagateError: true }); }
+  catch (error) {
+    state.events = previousEvents; state.checks = previousChecks;
+    writeStore("keyman-events", state.events); writeStore("keyman-checks", state.checks);
+    showToast(error.message || "Unable to save the schedule. Please try again.");
+    if (saveButton) saveButton.disabled = false;
+    return;
+  }
+  chiefReviewSnapshot = null;
   state.tab = "calendar";
   state.calendarDate = event.date;
   state.calendarMonth = monthStartISO(event.date);
@@ -1492,145 +1628,25 @@ function resetRotationFlow() {
 }
 
 function renderRosterReview() {
-  const capacity = availableVolunteerSlotCount();
-  const selectedCount = state.rosterReview.filter((contact) => contact.selected).length;
-  return `
-    <div class="roster-review-overlay" role="dialog" aria-modal="true" aria-labelledby="rosterReviewTitle">
-      <button class="roster-review-backdrop" id="closeRosterReviewBackdrop" type="button" aria-label="Close roster review"></button>
-      <article class="roster-review-sheet">
-        <div class="roster-review-header">
-          <div>
-            <p class="detail-kicker">On-device image scan</p>
-            <h2 id="rosterReviewTitle">Review volunteers</h2>
-            <p class="subtle">Confirm every name and number before filling the shift.</p>
-          </div>
-          <button class="icon-btn" id="closeRosterReview" type="button" aria-label="Close roster review">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 6-12 12"></path><path d="m6 6 12 12"></path></svg>
-          </button>
-        </div>
-        <div class="roster-capacity" role="status">
-          <strong>${selectedCount} selected</strong>
-          <span>${capacity} empty slot${capacity === 1 ? "" : "s"} available</span>
-        </div>
-        <div class="roster-review-list">
-          ${state.rosterReview.map((contact, index) => `
-            <div class="roster-review-row ${contact.needsReview ? "needs-review" : ""}">
-              <label class="roster-include">
-                <input class="roster-select" data-index="${index}" type="checkbox" ${contact.selected ? "checked" : ""} ${!contact.name ? "disabled" : ""}>
-                <span>Include</span>
-              </label>
-              <label>
-                <span>Name</span>
-                <input class="name-input roster-review-input" data-index="${index}" data-field="name" value="${escapeAttr(contact.name)}" placeholder="Volunteer name">
-              </label>
-              <label>
-                <span>Phone</span>
-                <input class="phone-input roster-review-input" data-index="${index}" data-field="phone" type="tel" inputmode="tel" value="${escapeAttr(contact.phone)}" placeholder="Phone number">
-              </label>
-              ${contact.needsReview ? `<p class="roster-confidence">Check this result${contact.confidence ? ` · ${Math.round(contact.confidence * 100)}% OCR confidence` : ""}</p>` : ""}
-            </div>
-          `).join("")}
-        </div>
-        ${state.message ? `<p class="message roster-review-message">${escapeText(state.message)}</p>` : ""}
-        <div class="roster-review-actions">
-          <button class="secondary-btn" id="discardRosterReview" type="button">Discard import</button>
-          <button class="primary-btn" id="applyRosterReview" type="button" ${selectedCount === 0 || selectedCount > capacity ? "disabled" : ""}>Add selected volunteers</button>
-        </div>
-      </article>
-    </div>
-  `;
+  return rosterReviewMarkup({ contacts: state.rosterReview, capacity: availableVolunteerSlotCount(), message: state.message });
 }
 
+let manualRosterScan = null;
 async function importRosterImageFile(file) {
-  const plugin = getVolunteerToolsPlugin();
-  if (!plugin?.recognizeRosterImage) {
-    state.message = "Roster image import is available in the installed iPhone app.";
-    renderBuilder();
-    return;
-  }
-  if (file.type && !String(file.type).startsWith("image/")) {
-    state.message = "Choose an image file to import a roster.";
-    renderBuilder();
-    return;
-  }
-  if (file.size > 20 * 1024 * 1024) {
-    state.message = "Choose an image smaller than 20 MB.";
-    renderBuilder();
-    return;
-  }
-
-  state.rosterSourceOpen = false;
-  state.rosterBusy = true;
-  state.message = "";
-  const importButton = app.querySelector("#importRosterImage");
-  if (importButton) {
-    importButton.disabled = true;
-    importButton.textContent = "Reading image…";
-    importButton.setAttribute("aria-busy", "true");
-  }
-
-  let recognitionStarted = false;
+  manualRosterScan?.abort();
+  const scan = new AbortController(); manualRosterScan = scan;
+  state.rosterBusy = true; state.message = 'Recognizing volunteer names and phone numbers on this device…'; renderBuilder();
   try {
-    const dataUrl = await withTimeout(
-      readFileAsDataURL(file),
-      20_000,
-      "The selected image took too long to open. Please choose it again.",
-    );
-    state.message = "Recognizing volunteer names and phone numbers on this device…";
-    renderBuilder();
-    recognitionStarted = true;
-    const result = await withTimeout(
-      plugin.recognizeRosterImage({ dataUrl }),
-      45_000,
-      "Text recognition took too long. Please try the image again.",
-    );
-    if (result?.cancelled) {
-      state.message = "Roster image import cancelled.";
-      return;
-    }
-    const contacts = parseRosterObservations(result?.observations || []);
-    if (!contacts.length) {
-      state.message = "No volunteer names or phone numbers were recognized. Try a clearer image.";
-      return;
-    }
+    const contacts = await scanRosterImage(file, { plugin: getVolunteerToolsPlugin(), signal: scan.signal });
+    if (scan.signal.aborted || manualRosterScan !== scan) return;
     state.rosterReview = prepareRosterReview(contacts, availableVolunteerSlotCount());
-    state.rosterReviewOpen = true;
-    state.message = "";
-  } catch (error) {
-    if (recognitionStarted) {
-      try {
-        await plugin.cancelRosterImport?.();
-      } catch {
-        // The OCR request may already have completed or rejected.
-      }
-    }
-    state.message = error?.message || "The roster image could not be read.";
-  } finally {
-    state.rosterBusy = false;
-    renderBuilder();
-  }
-}
-
-function readFileAsDataURL(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.addEventListener("load", () => resolve(String(reader.result || "")), { once: true });
-    reader.addEventListener("error", () => reject(reader.error || new Error("The selected image could not be read.")), { once: true });
-    reader.addEventListener("abort", () => reject(new Error("The selected image could not be read.")), { once: true });
-    reader.readAsDataURL(file);
-  });
-}
-
-function withTimeout(promise, milliseconds, message) {
-  let timeoutId;
-  const timeout = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error(message)), milliseconds);
-  });
-  return Promise.race([Promise.resolve(promise), timeout])
-    .finally(() => clearTimeout(timeoutId));
+    state.rosterReviewOpen = true; state.message = '';
+  } catch (error) { if (manualRosterScan === scan) state.message = error.message; }
+  finally { if (manualRosterScan === scan) { manualRosterScan = null; state.rosterBusy = false; renderBuilder(); } }
 }
 
 async function cancelRosterImport() {
+  manualRosterScan?.abort(); manualRosterScan = null;
   const plugin = getVolunteerToolsPlugin();
   try {
     await plugin?.cancelRosterImport?.();
@@ -2664,11 +2680,14 @@ async function loadAccountData() {
   }
 }
 
-function persistAppData({ immediate = false } = {}) {
+function persistAppData({ immediate = false, propagateError = false } = {}) {
   saveAppDataLocal();
   if (!state.authenticated || !getAuthToken()) return Promise.resolve();
   clearTimeout(appDataSyncTimer);
-  if (immediate) return saveAccountData(getAppDataSnapshot()).catch(() => {});
+  if (immediate) {
+    const saving = saveAccountData(getAppDataSnapshot());
+    return propagateError ? saving : saving.catch(() => {});
+  }
   appDataSyncTimer = setTimeout(() => {
     saveAccountData(getAppDataSnapshot()).catch(() => {});
   }, 500);
@@ -2730,6 +2749,9 @@ function clearAuthToken() {
 }
 
 function clearSignedInState({ clearLocalData = false } = {}) {
+  manualRosterScan?.abort(); manualRosterScan = null;
+  chiefChat.clear();
+  chiefReviewSnapshot = null;
   clearTimeout(appDataSyncTimer);
   clearTimeout(noteAutosaveTimer);
   clearAuthToken();
@@ -2915,16 +2937,24 @@ function escapeText(value) {
   })[char]);
 }
 
-async function updateNativeStatusBar(color) {
+let statusBarUpdate = Promise.resolve();
+let statusBarRevision = 0;
+function updateNativeStatusBar(color) {
   const statusBar = window.Capacitor?.Plugins?.StatusBar;
   if (!statusBar) return;
-  try {
+  const revision = ++statusBarRevision;
+  const preference = document.documentElement.dataset.appearance;
+  const dark = preference === 'dark' || (preference !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const style = dark ? "DARK" : "LIGHT";
+  statusBarUpdate = statusBarUpdate.then(async () => {
+    if (revision !== statusBarRevision) return;
     await statusBar.setOverlaysWebView({ overlay: false });
-    await statusBar.setStyle({ style: "LIGHT" });
+    await statusBar.setStyle({ style });
     await statusBar.setBackgroundColor({ color });
-  } catch {
-    // The native status bar bridge is unavailable in regular browsers.
-  }
+  }).catch(() => {
+    // Appearance must remain usable even when the optional native bridge fails.
+  });
+  return statusBarUpdate;
 }
 
 if ("serviceWorker" in navigator) {
@@ -2936,4 +2966,5 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("online", validateSessionOnResume);
 
+watchSystemAppearance(updateShellSurface, { window, document });
 initializeAuth();

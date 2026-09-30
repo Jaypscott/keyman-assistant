@@ -3,10 +3,13 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
-    <meta name="theme-color" content="#10434f" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#182f2c" media="(prefers-color-scheme: dark)" />
     <title>Keyman Assistant</title>
+    <script>try { const appearance = localStorage.getItem('keyman-appearance'); if (appearance === 'light' || appearance === 'dark') document.documentElement.dataset.appearance = appearance; } catch {}</script>
     <link rel="manifest" href="manifest.json" />
-    <link rel="stylesheet" href="styles.css?v=63" />
+    <link rel="stylesheet" href="styles.css?v=74" />
   </head>
   <body>
     <div class="phone-shell">
@@ -32,6 +35,6 @@
     </div>
 
     <script src="config.js?v=2"></script>
-    <script type="module" src="app.js?v=65"></script>
+    <script type="module" src="app.js?v=74"></script>
   </body>
 </html>

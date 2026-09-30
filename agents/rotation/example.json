@@ -1,0 +1,9 @@
+{
+  "date": "2026-10-03",
+  "locationId": "jax-fishing-pier",
+  "shiftId": "jax-pier-midday",
+  "names": ["Alex Example", "Blair Example", "Casey Example", "Drew Example", "Ellis Example", "Finley Example"],
+  "duration": 30,
+  "primaryOnly": false,
+  "availableWholeShift": true
+}

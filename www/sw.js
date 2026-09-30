@@ -1,10 +1,16 @@
-const CACHE_NAME = "keyman-shift-planner-v96";
+const CACHE_NAME = "keyman-shift-planner-v107";
 const ASSETS = [
   "./",
   "index.html",
-  "styles.css?v=63",
+  "styles.css?v=74",
   "config.js?v=2",
-  "app.js?v=65",
+  "app.js?v=74",
+  "components/ChiefChat.mjs",
+  "components/RosterReview.mjs",
+  "services/chief/chiefRoster.mjs",
+  "services/volunteers/rosterImport.mjs",
+  "services/chief/chiefChat.mjs",
+  "services/chief/chiefDraft.mjs",
   "components/LocationHomePage.mjs",
   "components/WeatherCard.mjs",
   "constants/weatherConfig.mjs",
@@ -17,6 +23,7 @@ const ASSETS = [
   "services/volunteers/rosterService.mjs",
   "services/auth/sessionTokenStorage.mjs",
   "services/auth/passwordResetState.mjs",
+  "services/appearance/systemAppearance.mjs",
   "types/weather.mjs",
   "manifest.json",
   "public/privacy.html",

@@ -4,6 +4,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import pg from "pg";
+import { createChiefStore } from "./server/chiefStore.mjs";
+import { createChiefService } from "./server/chiefService.mjs";
 import {
   createPasswordRecord,
   createResetCode,
@@ -46,6 +48,8 @@ pool?.on("error", (error) => {
   console.error(JSON.stringify({ event: "database_pool_error", code: safeErrorCode(error) }));
 });
 let postgresReady;
+const chiefStore = createChiefStore({ pool, ensurePostgres, file: resolve(dirname(DATA_FILE), "chief-conversations.json") });
+export const chiefService = createChiefService({ store: chiefStore });
 
 function safeErrorCode(error) {
   return /^[A-Z0-9_]{2,40}$/.test(error?.code || "") ? error.code : "UNKNOWN";
@@ -674,6 +678,7 @@ async function handleDeleteMe(request, response) {
   const user = await getSessionUser(request);
   if (!user) return sendJson(response, 401, { error: "Sign in required." });
 
+  await chiefService.reset(user.id, null, true);
   await deleteUserAccount(user.id, token);
   return sendJson(response, 200, { ok: true });
 }
@@ -744,6 +749,25 @@ function handlePrivacy(response) {
   return sendHtml(response, 200, readFileSync(PRIVACY_FILE, "utf8"));
 }
 
+async function handleChief(request, response, path) {
+  const user = await getSessionUser(request);
+  if (!user) return sendJson(response, 401, { error: "Sign in required." });
+  try {
+    if (path === "/api/chief/conversation" && request.method === "GET") return sendJson(response, 200, await chiefService.get(user.id));
+    if (path === "/api/chief/messages" && request.method === "POST") return sendJson(response, 202, await chiefService.send(user.id, await readBody(request)));
+    if (path === "/api/chief/attachments" && request.method === "POST") return sendJson(response, 202, await chiefService.completeAttachment(user.id, await readBody(request)));
+    if (path === "/api/chief/conversation" && request.method === "DELETE") {
+      const body = await readBody(request);
+      if (typeof body.conversationId !== "string") return sendJson(response, 400, { error: "Conversation ID required." });
+      return sendJson(response, 200, await chiefService.reset(user.id, body.conversationId));
+    }
+    return sendJson(response, 405, { error: "Method not allowed." });
+  } catch (error) {
+    const status = [400,409,503].includes(error.status) ? error.status : 500;
+    return sendJson(response, status, { error: status === 500 ? "Chief is temporarily unavailable. Please try again." : error.message });
+  }
+}
+
 export const server = createServer(async (request, response) => {
   const startedAt = performance.now();
   // Restrict log paths to known routes; omit query strings, bodies, and headers.
@@ -751,6 +775,7 @@ export const server = createServer(async (request, response) => {
   const route = ["/api/health", "/api/weather", "/privacy", "/privacy.html",
     "/api/auth/register", "/api/auth/login", "/api/auth/password-reset/request",
     "/api/auth/password-reset", "/api/auth/me", "/api/auth/logout", "/api/app-data",
+    "/api/chief/conversation", "/api/chief/messages", "/api/chief/attachments",
   ].includes(path) ? path : "unmatched";
   const logSlowRequest = (event) => console.warn(JSON.stringify({
     event, route, durationMs: Math.round(performance.now() - startedAt),
@@ -764,6 +789,7 @@ export const server = createServer(async (request, response) => {
   });
   try {
     if (request.method === "OPTIONS") return sendJson(response, 204, {});
+    if (["/api/chief/conversation", "/api/chief/messages", "/api/chief/attachments"].includes(path)) return await handleChief(request, response, path);
     if (request.url === "/api/health") return await handleHealth(response);
     if (request.url?.startsWith("/api/weather?") && request.method === "GET") return await handleWeather(request, response);
     if ((request.url === "/privacy" || request.url === "/privacy.html") && request.method === "GET") return await handlePrivacy(response);

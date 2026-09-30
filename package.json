@@ -7,18 +7,25 @@
     "node": ">=20"
   },
   "scripts": {
+    "agent:rotation": "node agents/rotation/run.mjs",
+    "agent:rotation:offline": "node agents/rotation/run.mjs --offline",
+    "test:rotation-agent": "node --test tests/rotationAgent.test.mjs tests/rotationService.test.mjs",
     "start": "node server.mjs",
     "auth:server": "node server.mjs",
     "test": "node --test tests/*.test.mjs",
     "build": "node scripts/build-native.mjs",
     "native:sync": "npm run build && LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 PATH=\"$HOME/.gem/ruby/2.6.0/bin:$PATH\" npx cap sync",
     "native:ios": "npm run build && LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 PATH=\"$HOME/.gem/ruby/2.6.0/bin:$PATH\" npx cap add ios",
-    "native:open:ios": "npx cap open ios"
+    "native:open:ios": "npx cap open ios",
+    "chief:server": "node --env-file=.env.local server.mjs",
+    "chief:preview": "node scripts/chief-preview.mjs",
+    "test:chief": "node --test tests/chief*.test.mjs"
   },
   "dependencies": {
     "@capacitor/core": "^7.0.0",
     "@capacitor/ios": "^7.0.0",
     "@capacitor/status-bar": "^7.0.6",
+    "openai": "^7.25.0",
     "pg": "^8.21.0"
   },
   "devDependencies": {

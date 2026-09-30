@@ -5,13 +5,11 @@
   "bundledWebRuntime": false,
   "plugins": {
     "StatusBar": {
-      "overlaysWebView": false,
-      "style": "LIGHT",
-      "backgroundColor": "#dff3ec"
+      "overlaysWebView": true,
+      "style": "DEFAULT"
     }
   },
   "ios": {
-    "backgroundColor": "#f6faf8",
     "contentInset": "never"
   }
 }
